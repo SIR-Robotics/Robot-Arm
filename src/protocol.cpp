@@ -14,12 +14,13 @@ static char posesBuf[3000];
 const char* buildStatus() {
     snprintf(statusBuf, sizeof(statusBuf),
         "{\"t\":\"s\",\"j\":[%d,%d,%d,%d,%d,%d],"
-        "\"m\":%u,\"l\":%d,\"p\":%d,\"c\":%d,\"i\":%d,\"r\":%d}",
+        "\"m\":%u,\"l\":%d,\"p\":%d,\"c\":%d,\"i\":%d,\"r\":%d,\"w\":%u}",
         joints[0].cur, joints[1].cur, joints[2].cur,
         joints[3].cur, joints[4].cur, joints[5].cur,
         (unsigned)joyMode, seqLen,
         isPlaying ? 1 : 0, isCycling ? 1 : 0, playIdx,
-        (int)WiFi.RSSI());
+        (int)WiFi.RSSI(),
+        (unsigned)wrapState);
     return statusBuf;
 }
 
@@ -39,6 +40,19 @@ const char* buildPoses() {
     return posesBuf;
 }
 
+const char* buildPresets() {
+    char* p   = posesBuf;
+    char* end = posesBuf + sizeof(posesBuf);
+    p += snprintf(p, end - p, "{\"t\":\"pl\",\"i\":[");
+    for (int i = 0; i < MAX_PRESETS && (end - p) > 60; i++) {
+        if (i) *p++ = ',';
+        p += snprintf(p, end - p, "{\"n\":\"%s\",\"l\":%d}",
+                      presets[i].name, presets[i].len);
+    }
+    if ((end - p) >= 3) { *p++ = ']'; *p++ = '}'; *p = '\0'; }
+    return posesBuf;
+}
+
 void broadcastStatus() {
     if (ws.count() == 0) return;
     ws.textAll(buildStatus());
@@ -46,6 +60,24 @@ void broadcastStatus() {
 void broadcastPoses() {
     if (ws.count() == 0) return;
     ws.textAll(buildPoses());
+}
+void broadcastPresets() {
+    if (ws.count() == 0) return;
+    ws.textAll(buildPresets());
+}
+
+// Accept "0".."3" or back-compat name; returns 255 on miss.
+static uint8_t parsePresetArg(const char* a) {
+    if (!a) return 255;
+    if (a[0] >= '0' && a[0] <= '9') {
+        int n = atoi(a);
+        return (n >= 0 && n < MAX_PRESETS) ? (uint8_t)n : 255;
+    }
+    if (!strcmp(a, "home"))  return 0;
+    if (!strcmp(a, "ready")) return 1;
+    if (!strcmp(a, "pick"))  return 2;
+    if (!strcmp(a, "place")) return 3;
+    return 255;
 }
 
 // ── WS protocol ─────────────────────────────────────────────────────────────
@@ -95,26 +127,41 @@ void processWsCmd(char* msg) {
             if (j >= 0 && j < 6 && a >= 0) { setServo(j, a); pendingBroadcast = true; }
             break;
         }
-        case TAG('P','R'): {
-            if (!args[0]) break;
-            const int* p = nullptr;
-            if      (!strcmp(args[0], "home"))  p = POSE_HOME;
-            else if (!strcmp(args[0], "ready")) p = POSE_READY;
-            else if (!strcmp(args[0], "pick"))  p = POSE_PICK;
-            else if (!strcmp(args[0], "place")) p = POSE_PLACE;
-            if (p) applyPreset(p);   // staged + slow
+        case TAG('P','R'): {                             // Play preset (1-pose staged or sequence)
+            uint8_t idx = parsePresetArg(args[0]);
+            if (idx < MAX_PRESETS) playPreset(idx);
             break;
         }
-        case TAG('S','P'): {                             // Set Preset from current
-            if (!args[0]) break;
-            uint8_t idx = 255;
-            if      (!strcmp(args[0], "home"))  idx = 0;
-            else if (!strcmp(args[0], "ready")) idx = 1;
-            else if (!strcmp(args[0], "pick"))  idx = 2;
-            else if (!strcmp(args[0], "place")) idx = 3;
-            if (idx < 4) setPresetFromCurrent(idx);
+        case TAG('S','P'): {                             // Save current pose to preset (1-pose)
+            uint8_t idx = parsePresetArg(args[0]);
+            if (idx < MAX_PRESETS) {
+                setPresetFromCurrent(idx);
+                broadcastPresets();
+            }
             break;
         }
+        case TAG('S','Q'): {                             // Save current recording to preset (sequence)
+            if (!args[0]) break;
+            int idx = atoi(args[0]);
+            if (idx < 0 || idx >= MAX_PRESETS || seqLen <= 0) break;
+            int n = (seqLen < MAX_POSES_PER_PRESET) ? seqLen : MAX_POSES_PER_PRESET;
+            for (int i = 0; i < n; i++) presets[idx].seq[i] = seq[i];
+            presets[idx].len = n;
+            savePresetsToFlash();
+            broadcastPresets();
+            Serial.printf("[PRESET %d] saved %d poses from recording\n", idx, n);
+            break;
+        }
+        case TAG('P','N'): {                             // rename Preset Name
+            if (!args[0] || !args[1] || !*args[1]) break;
+            int idx = atoi(args[0]);
+            if (idx >= 0 && idx < MAX_PRESETS) {
+                renamePreset((uint8_t)idx, args[1]);
+                broadcastPresets();
+            }
+            break;
+        }
+        case TAG('T','H'): startWrappedPlay(); break;    // Test: Home → recording → Home
         case TAG('M','D'): {
             if (!args[0]) break;
             int m = atoi(args[0]);
@@ -241,6 +288,7 @@ void onWsEvent(AsyncWebSocket*, AsyncWebSocketClient* client,
     if (type == WS_EVT_CONNECT) {
         if (client->canSend()) client->text(buildStatus());
         if (client->canSend()) client->text(buildPoses());
+        if (client->canSend()) client->text(buildPresets());
     } else if (type == WS_EVT_DISCONNECT) {
         for (int j = 0; j < 6; j++) webJog[j] = 0;
     } else if (type == WS_EVT_DATA) {
@@ -312,6 +360,36 @@ void processSerial() {
     else if (cmd == "CLEAR") clearRecording();
     else if (cmd == "SAVE")  saveToFlash();
     else if (cmd == "LOAD")  loadFromFlash();
+    else if (cmd.startsWith("PRESET")) {
+        if (cmd.length() <= 6) {
+            Serial.println("Usage: PRESET <0-3>");
+        } else {
+            int idx = cmd.substring(7).toInt();
+            if (idx >= 0 && idx < MAX_PRESETS) playPreset((uint8_t)idx);
+            else Serial.println("Preset 0-3");
+        }
+    }
+    else if (cmd == "WRAP") {
+        startWrappedPlay();
+    }
+    else if (cmd.startsWith("RENAME")) {
+        // RENAME <idx> <name>  — note: cmd is already uppercased by processSerial
+        int s1 = cmd.indexOf(' ');
+        int s2 = cmd.indexOf(' ', s1 + 1);
+        if (s1 < 0 || s2 < 0) {
+            Serial.println("Usage: RENAME <0-3> <name>  (uppercase only via serial)");
+        } else {
+            int idx = cmd.substring(s1 + 1, s2).toInt();
+            String nm = cmd.substring(s2 + 1);
+            nm.trim();
+            if (idx >= 0 && idx < MAX_PRESETS) {
+                char buf[20]; nm.toCharArray(buf, sizeof(buf));
+                renamePreset((uint8_t)idx, buf);
+            } else {
+                Serial.println("Preset 0-3");
+            }
+        }
+    }
     else if (cmd == "STATUS") {
         Serial.println("-- Joints --");
         for (int i = 0; i < 6; i++)
@@ -390,7 +468,10 @@ void processSerial() {
     else if (cmd == "HELP") {
         Serial.println("S <j> <a> | INVERT <j> | TEST | HOME/READY/PICK/PLACE");
         Serial.println("REC | PLAY | STOP | CYCLE | CLEAR | SAVE | LOAD | STATUS");
-        Serial.println("SPEED [deg/sec]  - smooth motion ramp rate (default 120)");
+        Serial.println("SPEED [deg/sec]   - smooth motion ramp rate (default 40)");
+        Serial.println("PRESET <0-3>      - play preset (1-pose staged, multi-pose playback)");
+        Serial.println("RENAME <0-3> <nm> - rename preset (uppercase via serial)");
+        Serial.println("WRAP              - Home -> live recording -> Home (test)");
         Serial.println("RAW <j> <counts> | SWEEP <j> <start> <end> [step] | CALSHOW");
     }
     else if (cmd.length() > 0) Serial.println("Unknown. HELP.");

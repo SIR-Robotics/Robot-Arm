@@ -28,6 +28,10 @@ bool     isCycling  = false;
 int      playIdx    = 0;
 uint32_t playNextMs = 0;
 
+Pose*     playSrc    = nullptr;
+int       playSrcLen = 0;
+WrapState wrapState  = WRAP_IDLE;
+
 Preset presets[MAX_PRESETS] = {
     { "Home",  1, { { { 129, 62, 86, 86, 86,  0 }, "" } } },
     { "Ready", 1, { { {  90, 60, 90, 90, 90, 45 }, "" } } },
@@ -246,6 +250,7 @@ void renamePose(int idx, const char* name) {
 
 void startPlayback() {
     if (!seqLen) { Serial.println("[PLAY] Empty"); return; }
+    playSrc = seq; playSrcLen = seqLen;
     isCycling = false; isPlaying = true;
     playIdx = 0; playNextMs = millis();
     pendingBroadcast = true;
@@ -255,6 +260,7 @@ void stopPlayback() { isPlaying = false; isCycling = false; pendingBroadcast = t
 
 void startCycle() {
     if (!seqLen) { Serial.println("[CYCLE] Empty"); return; }
+    playSrc = seq; playSrcLen = seqLen;
     isPlaying = false; isCycling = true;
     playIdx = 0; playNextMs = millis();
     pendingBroadcast = true;
@@ -296,9 +302,89 @@ void setPresetFromCurrent(uint8_t idx) {
         default: return;
     }
     for (int i = 0; i < 6; i++) p[i] = joints[i].cur;
+    presets[idx].len = 1;          // teaching a single pose collapses the slot
     savePresetsToFlash();
     Serial.printf("[PRESET] %s = [%d %d %d %d %d %d]\n", name,
         p[0], p[1], p[2], p[3], p[4], p[5]);
+}
+
+void renamePreset(uint8_t idx, const char* name) {
+    if (idx >= MAX_PRESETS || !name) return;
+    strncpy(presets[idx].name, name, sizeof(presets[idx].name) - 1);
+    presets[idx].name[sizeof(presets[idx].name) - 1] = '\0';
+    savePresetsToFlash();
+    Serial.printf("[PRESET %u] renamed to \"%s\"\n", (unsigned)idx, presets[idx].name);
+}
+
+void playPreset(uint8_t idx) {
+    if (idx >= MAX_PRESETS) return;
+    if (presets[idx].len <= 0) {
+        Serial.printf("[PRESET %u \"%s\"] empty\n", (unsigned)idx, presets[idx].name);
+        return;
+    }
+    if (presets[idx].len == 1) {
+        // Single-pose preset → staged 3-phase move (clearance → elev → align)
+        applyPreset(presets[idx].seq[0].a);
+        Serial.printf("[PRESET %u \"%s\"] staged 1-pose move\n",
+                      (unsigned)idx, presets[idx].name);
+    } else {
+        // Multi-pose preset → playback through motion engine
+        playSrc = presets[idx].seq;
+        playSrcLen = presets[idx].len;
+        isCycling = false; isPlaying = true;
+        playIdx = 0; playNextMs = millis();
+        pendingBroadcast = true;
+        Serial.printf("[PRESET %u \"%s\"] playing %d poses\n",
+                      (unsigned)idx, presets[idx].name, presets[idx].len);
+    }
+}
+
+// Wrap test: Home → live recording → Home. Polled from loop() via processWrap.
+// Refuses to start if any motion is already in progress.
+void startWrappedPlay() {
+    if (wrapState != WRAP_IDLE) {
+        Serial.println("[WRAP] Already running");
+        return;
+    }
+    if (seqLen == 0) {
+        Serial.println("[WRAP] Live recording is empty");
+        return;
+    }
+    if (isPlaying || isCycling || presetActive) {
+        Serial.println("[WRAP] Motion in progress — cancel first");
+        return;
+    }
+    Serial.println("[WRAP] Step 1/3: Home");
+    wrapState = WRAP_HOMING_PRE;
+    playPreset(0);                      // preset 0 = Home; handles 1- or multi-pose
+    pendingBroadcast = true;
+}
+
+void processWrap() {
+    if (wrapState == WRAP_IDLE) return;
+
+    // A step is "done" when no motion engine has work left for it.
+    bool motionIdle = !presetActive && !isPlaying && !isCycling;
+    if (!motionIdle) return;
+
+    switch (wrapState) {
+        case WRAP_HOMING_PRE:
+            Serial.println("[WRAP] Step 2/3: Playing recording");
+            wrapState = WRAP_PLAYING_REC;
+            startPlayback();
+            break;
+        case WRAP_PLAYING_REC:
+            Serial.println("[WRAP] Step 3/3: Returning to Home");
+            wrapState = WRAP_HOMING_POST;
+            playPreset(0);
+            break;
+        case WRAP_HOMING_POST:
+            Serial.println("[WRAP] Complete");
+            wrapState = WRAP_IDLE;
+            pendingBroadcast = true;
+            break;
+        default: break;
+    }
 }
 
 void savePresetsToFlash() {
@@ -355,8 +441,11 @@ void loadPresetsFromFlash() {
 void processPlayback() {
     if (!isPlaying && !isCycling) return;
     if (millis() < playNextMs)    return;
+    if (!playSrc || playSrcLen == 0) {
+        isPlaying = false; isCycling = false; return;
+    }
 
-    if (playIdx >= seqLen) {
+    if (playIdx >= playSrcLen) {
         if (isCycling) { playIdx = 0; }
         else {
             isPlaying = false; playIdx = 0;
@@ -366,9 +455,9 @@ void processPlayback() {
         }
     }
 
-    for (int i = 0; i < 6; i++) setServo(i, seq[playIdx].a[i]);   // smooth ramp
+    for (int i = 0; i < 6; i++) setServo(i, playSrc[playIdx].a[i]);   // smooth ramp
     Serial.printf("[%s] %d/%d \"%s\"\n",
-        isCycling ? "CYC" : "PLAY", playIdx + 1, seqLen, seq[playIdx].label);
+        isCycling ? "CYC" : "PLAY", playIdx + 1, playSrcLen, playSrc[playIdx].label);
     playIdx++;
     playNextMs = millis() + PLAY_STEP_MS;
     pendingBroadcast = true;

@@ -4,8 +4,10 @@
 
 const char* buildStatus();
 const char* buildPoses();
+const char* buildPresets();
 void        broadcastStatus();
 void        broadcastPoses();
+void        broadcastPresets();
 
 void processWsCmd(char* msg);
 void onWsEvent(AsyncWebSocket*, AsyncWebSocketClient* client,

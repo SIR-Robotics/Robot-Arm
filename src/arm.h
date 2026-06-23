@@ -17,6 +17,15 @@ extern bool   isCycling;
 extern int    playIdx;
 extern uint32_t playNextMs;
 
+// Playback source — points at seq[] (live recording) or presets[i].seq.
+// Set by startPlayback / startCycle / playPreset before kicking the engine.
+extern Pose* playSrc;
+extern int   playSrcLen;
+
+// Wrap test: Home → live recording → Home.
+enum WrapState { WRAP_IDLE, WRAP_HOMING_PRE, WRAP_PLAYING_REC, WRAP_HOMING_POST };
+extern WrapState wrapState;
+
 // Sequence-capable preset slots. Each can hold up to MAX_POSES_PER_PRESET poses.
 extern Preset presets[MAX_PRESETS];
 
@@ -42,6 +51,7 @@ extern bool presetActive;                     // true while a staged preset is i
 
 // ── Teachable presets
 void setPresetFromCurrent(uint8_t idx);       // 0=home 1=ready 2=pick 3=place
+void renamePreset(uint8_t idx, const char* name);  // writes through to flash
 void savePresetsToFlash();
 void loadPresetsFromFlash();
 
@@ -56,3 +66,6 @@ void clearRecording();
 void saveToFlash();
 void loadFromFlash();
 void processPlayback();
+void playPreset(uint8_t idx);                 // 1-pose → staged move; multi-pose → playback
+void startWrappedPlay();                      // Home → live recording → Home
+void processWrap();                           // poller in loop()

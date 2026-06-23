@@ -101,6 +101,7 @@ void loop() {
     processButtons();
     processPlayback();
     processPresetMove();      // advances staged preset moves between phases
+    processWrap();            // advances the home → recording → home test
     processMotion();          // ramps servoCur -> servoTarget at motionSpeed
     processSerial();
 

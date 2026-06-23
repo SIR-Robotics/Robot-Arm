@@ -60,13 +60,18 @@ button.amb.on{background:linear-gradient(180deg,#e6a817,#c08810);color:#111;bord
 .pa{color:#556;font-size:.64rem;cursor:pointer;font-family:Consolas,monospace}
 .pa:hover{color:var(--ac3)}
 .ri{background:var(--p2);color:var(--tx);border:1px solid var(--ac);border-radius:4px;padding:2px 5px;font-size:.78rem;width:120px;outline:none}
+.ps{display:flex;flex-direction:column;align-items:center;gap:3px;padding:9px 6px}
+.ps .pnm{font-size:.85rem;font-weight:800;color:var(--tx);padding:1px 6px;border-radius:4px}
+.ps .pnm:hover{background:rgba(79,195,247,.15);color:var(--ac3)}
+.ps .plc{font-size:.6rem;color:#789;letter-spacing:1px;text-transform:uppercase}
+.ps.seq .plc{color:var(--ac2)}
 #toast{position:fixed;left:50%;transform:translate(-50%,0);bottom:18px;background:rgba(20,28,50,.95);border:1px solid var(--ac);color:var(--tx);padding:9px 16px;border-radius:22px;font-size:.78rem;font-weight:600;opacity:0;pointer-events:none;transition:opacity .25s,transform .25s;box-shadow:0 4px 18px rgba(0,0,0,.5);z-index:99}
 #toast.show{opacity:1;transform:translate(-50%,-6px)}
 .kbd{font-size:.62rem;color:#456;margin-top:5px;text-align:center;letter-spacing:1px}
 .kbd kbd{background:#0a1428;border:1px solid #2a3a5e;border-radius:3px;padding:1px 5px;margin:0 1px;font-family:Consolas,monospace;color:var(--ac3)}
 @media(max-width:520px){.jr{grid-template-columns:repeat(3,1fr)}.jc .v{font-size:.95rem}.spad{max-width:180px}}
 </style></head><body>
-<div class=hud><span class=dot id=dt></span><span class=tt>ROBOARM</span><span class=gap></span><span class=pill id=ip>--</span><span class=pill>RSSI <b id=rs>--</b></span><span class=pill id=gpd style=display:none>&#127918; <b>GP</b></span></div>
+<div class=hud><span class=dot id=dt></span><span class=tt>ROBOARM</span><span class=gap></span><span class=pill id=wp style=display:none;color:#e6a817;font-weight:700>WRAP --</span><span class=pill id=ip>--</span><span class=pill>RSSI <b id=rs>--</b></span><span class=pill id=gpd style=display:none>&#127918; <b>GP</b></span></div>
 <div class=jr id=jr></div>
 <div class=pad>
  <div class=stk><div class=ttl>LEFT STICK</div><div class=sub>BASE / SHOULDER</div><div class=spad id=sL data-jx=0 data-jy=1><div class=knob></div></div><div class=kbd><kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd></div></div>
@@ -76,12 +81,7 @@ button.amb.on{background:linear-gradient(180deg,#e6a817,#c08810);color:#111;bord
  <div class=tw><div class=ttl>WRIST ROLL</div><div class=trk id=tR data-j=4><div class=tnb></div></div><div class=kbd><kbd>Q</kbd><kbd>E</kbd></div></div>
  <div class=tw><div class=ttl>GRIPPER</div><div class=trk id=tG data-j=5><div class=tnb></div></div><div class=kbd><kbd>Z</kbd><kbd>X</kbd></div></div>
 </div>
-<div class=p><h2>Presets</h2><div class=g4>
- <button class=ps data-pn=home data-pl=Home>&#127968; Home</button>
- <button class=ps data-pn=ready data-pl=Ready>&#9889; Ready</button>
- <button class=ps data-pn=pick data-pl=Pick>&#129693; Pick</button>
- <button class=ps data-pn=place data-pl=Place>&#128230; Place</button>
-</div><div class=kbd style=margin-top:7px>Tap to go &mdash; long-press to save current position</div></div>
+<div class=p><h2>Presets</h2><div class=g4 id=psg></div><div class=kbd style=margin-top:7px>Tap card to run &mdash; tap name to rename &mdash; long-press to save current pose</div></div>
 <div class=p><h2>Recording <span class=bd id=rc>0</span></h2>
  <div class=g4 style=margin-bottom:7px>
   <button class=grn onclick="w('RC');tt('Recorded')">&#9679; REC</button>
@@ -98,6 +98,8 @@ button.amb.on{background:linear-gradient(180deg,#e6a817,#c08810);color:#111;bord
   <button onclick="eP()">&#11015; Export JSON</button>
   <button onclick="document.getElementById('iF').click()">&#11014; Import JSON</button>
  </div>
+ <button onclick="sSP()" style=width:100%;margin-top:7px>&#128190; Save sequence to preset&hellip;</button>
+ <button class=amb style=width:100%;margin-top:7px onclick="w('TH');tt('Wrap test')">&#127968; &#9654; &#127968; Test: Home &rarr; Play &rarr; Home</button>
  <input type=file id=iF accept=".json,application/json" style=display:none>
  <div class=pl id=pls></div>
  <div class=kbd style=margin-top:8px><kbd>SPACE</kbd>rec <kbd>P</kbd>play <kbd>O</kbd>stop <kbd>C</kbd>cycle <kbd>H</kbd>home</div>
@@ -106,6 +108,7 @@ button.amb.on{background:linear-gradient(180deg,#e6a817,#c08810);color:#111;bord
 <script>
 const JD=[{n:'BASE',k:'B',mn:0,mx:180,hm:90},{n:'SHOULDER',k:'S',mn:30,mx:150,hm:90},{n:'ELBOW',k:'E',mn:0,mx:135,hm:90},{n:'WRIST P',k:'WP',mn:0,mx:180,hm:90},{n:'WRIST R',k:'WR',mn:0,mx:180,hm:90},{n:'GRIPPER',k:'G',mn:0,mx:90,hm:45}];
 let ps=[],s,rT,lastA=[90,90,90,90,90,45],lastPlayIdx=-1;
+let pst=[{n:'Home',l:1},{n:'Ready',l:1},{n:'Pick',l:1},{n:'Place',l:1}];
 
 // Joint chips — click to manually set angle (server clamps to joint limits)
 const jr=document.getElementById('jr');
@@ -140,7 +143,7 @@ function cn(){
  s.onopen=()=>{sd(1);tt('Connected');clearTimeout(rT)};
  s.onclose=()=>{sd(0);tt('Disconnected');rT=setTimeout(cn,2500)};
  s.onerror=()=>s.close();
- s.onmessage=(e)=>{const d=JSON.parse(e.data);if(d.t==='s')aS(d);else if(d.t==='p')aP(d)};
+ s.onmessage=(e)=>{const d=JSON.parse(e.data);if(d.t==='s')aS(d);else if(d.t==='p')aP(d);else if(d.t==='pl')aL(d)};
 }
 function w(x){if(s&&s.readyState===1)s.send(x)}
 function sd(o){const d=document.getElementById('dt');d.classList.toggle('ok',!!o);d.classList.toggle('err',!o)}
@@ -162,6 +165,11 @@ function aS(d){
  const cb=document.getElementById('bc');cb.classList.toggle('on',!!d.c);
  cb.innerHTML=d.c?'■ CYCLE LOOP &mdash; ON':'&#9654;&#9654; CYCLE LOOP &mdash; OFF';
  if(typeof d.r==='number')document.getElementById('rs').textContent=d.r+' dBm';
+ const wp=document.getElementById('wp');
+ if(typeof d.w==='number'&&d.w>0){
+  const names=['','HOME &uarr;','PLAYING','HOME &darr;'];
+  wp.innerHTML='WRAP &mdash; '+names[d.w];wp.style.display='inline-block';
+ } else wp.style.display='none';
  if(d.c||d.p){
   if(d.i!==lastPlayIdx){lastPlayIdx=d.i;document.querySelectorAll('.pi').forEach((p,k)=>p.classList.toggle('cur',k===d.i-1))}
  } else if(lastPlayIdx!==-1){lastPlayIdx=-1;document.querySelectorAll('.pi').forEach(p=>p.classList.remove('cur'))}
@@ -319,31 +327,75 @@ setInterval(tick,50);
 
 function dc(){if(confirm('Clear all recorded poses?')){w('CL');tt('Cleared')}}
 
-// ── Presets: tap = goto, long-press = save current angles as that preset
-document.querySelectorAll('.ps').forEach(btn=>{
- const n=btn.dataset.pn,lbl=btn.dataset.pl;
- let timer=null,longFired=false;
- const start=e=>{
-  longFired=false;
-  timer=setTimeout(()=>{
-   longFired=true;
-   if(confirm('Save current arm position as "'+lbl+'" preset?')){
-    w('SP:'+n);tt(lbl+' saved');
-   }
-  },650);
- };
- const cancel=()=>clearTimeout(timer);
- btn.addEventListener('mousedown',start);
- btn.addEventListener('touchstart',start,{passive:true});
- btn.addEventListener('mouseup',cancel);
- btn.addEventListener('mouseleave',cancel);
- btn.addEventListener('touchend',cancel);
- btn.addEventListener('touchcancel',cancel);
- btn.onclick=()=>{
-  if(longFired){longFired=false;return}
-  w('PR:'+n);tt(lbl);
- };
-});
+// ── Presets: dynamic cards, populated from the pl broadcast frame ──────────
+function aL(d){if(d.i&&d.i.length){pst=d.i;rPS()}}
+function rPS(){
+ const e=document.getElementById('psg');e.innerHTML='';
+ pst.forEach((p,i)=>{
+  const btn=document.createElement('button');
+  btn.className='ps'+(p.l>1?' seq':'');
+  btn.dataset.pi=i;
+  btn.innerHTML=`<span class=pnm>${eh(p.n)}</span><span class=plc>${p.l} pose${p.l===1?'':'s'}</span>`;
+  e.appendChild(btn);
+ });
+ bindPresets();
+}
+function bindPresets(){
+ document.querySelectorAll('.ps').forEach(btn=>{
+  const i=+btn.dataset.pi;
+  const nm=btn.querySelector('.pnm');
+  let timer=null,longFired=false;
+  const start=e=>{
+   longFired=false;
+   timer=setTimeout(()=>{
+    longFired=true;
+    if(confirm('Save current arm position as "'+pst[i].n+'" (overwrites the sequence)?')){
+     w('SP:'+i);tt(pst[i].n+' saved');
+    }
+   },650);
+  };
+  const cancel=()=>clearTimeout(timer);
+  btn.addEventListener('mousedown',start);
+  btn.addEventListener('touchstart',start,{passive:true});
+  btn.addEventListener('mouseup',cancel);
+  btn.addEventListener('mouseleave',cancel);
+  btn.addEventListener('touchend',cancel);
+  btn.addEventListener('touchcancel',cancel);
+  btn.onclick=ev=>{
+   if(longFired){longFired=false;return}
+   if(ev.target===nm)return;          // name click handled separately
+   w('PR:'+i);tt('Run '+pst[i].n);
+  };
+  // Inline rename on name click
+  nm.onclick=ev=>{
+   ev.stopPropagation();
+   const old=pst[i].n;
+   nm.innerHTML=`<input class=ri type=text value="${eh(old)}" maxlength=19 style=width:90px;font-size:.78rem>`;
+   const I=nm.querySelector('input');I.focus();I.select();
+   const done=ok=>{
+    if(ok){
+     const v=I.value.trim().replace(/:/g,' ');
+     if(v&&v!==old){w('PN:'+i+':'+v);tt('Renamed');return}
+    }
+    nm.textContent=old;
+   };
+   I.onblur=()=>done(true);
+   I.onkeydown=k=>{if(k.key==='Enter')done(true);if(k.key==='Escape'){nm.textContent=old}k.stopPropagation()};
+  };
+ });
+}
+rPS();   // seed with defaults so something shows before first WS frame
+
+// ── Save current recording as a preset sequence
+function sSP(){
+ if(!ps.length){tt('Recording is empty');return}
+ const opts=pst.map((p,i)=>(i+1)+'. '+p.n+' ('+p.l+' pose'+(p.l===1?'':'s')+')').join('\n');
+ const r=prompt('Save current recording ('+ps.length+' poses) to which preset?\n'+opts+'\n\nEnter 1-'+pst.length+':');
+ if(r===null)return;
+ const idx=parseInt(r)-1;
+ if(isNaN(idx)||idx<0||idx>=pst.length){tt('Invalid');return}
+ w('SQ:'+idx);tt('Saved to '+pst[idx].n);
+}
 
 // ── Export / Import poses ────────────────────────────────────────────────
 function eP(){
