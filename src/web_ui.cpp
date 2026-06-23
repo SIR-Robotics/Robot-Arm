@@ -71,7 +71,7 @@ button.amb.on{background:linear-gradient(180deg,#e6a817,#c08810);color:#111;bord
 .kbd kbd{background:#0a1428;border:1px solid #2a3a5e;border-radius:3px;padding:1px 5px;margin:0 1px;font-family:Consolas,monospace;color:var(--ac3)}
 @media(max-width:520px){.jr{grid-template-columns:repeat(3,1fr)}.jc .v{font-size:.95rem}.spad{max-width:180px}}
 </style></head><body>
-<div class=hud><span class=dot id=dt></span><span class=tt>ROBOARM</span><span class=gap></span><span class=pill id=wp style=display:none;color:#e6a817;font-weight:700>WRAP --</span><span class=pill id=ip>--</span><span class=pill>RSSI <b id=rs>--</b></span><span class=pill id=gpd style=display:none>&#127918; <b>GP</b></span></div>
+<div class=hud><span class=dot id=dt></span><span class=tt>ROBOARM</span><span class=gap></span><span class=pill id=fsm style="color:#fff;background:#444;font-weight:700">--</span><span class=pill id=ip>--</span><span class=pill>RSSI <b id=rs>--</b></span><span class=pill id=gpd style=display:none>&#127918; <b>GP</b></span></div>
 <div class=jr id=jr></div>
 <div class=pad>
  <div class=stk><div class=ttl>LEFT STICK</div><div class=sub>BASE / SHOULDER</div><div class=spad id=sL data-jx=0 data-jy=1><div class=knob></div></div><div class=kbd><kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd></div></div>
@@ -99,7 +99,6 @@ button.amb.on{background:linear-gradient(180deg,#e6a817,#c08810);color:#111;bord
   <button onclick="document.getElementById('iF').click()">&#11014; Import JSON</button>
  </div>
  <button onclick="sSP()" style=width:100%;margin-top:7px>&#128190; Save sequence to preset&hellip;</button>
- <button class=amb style=width:100%;margin-top:7px onclick="w('TH');tt('Wrap test')">&#127968; &#9654; &#127968; Test: Home &rarr; Play &rarr; Home</button>
  <input type=file id=iF accept=".json,application/json" style=display:none>
  <div class=pl id=pls></div>
  <div class=kbd style=margin-top:8px><kbd>SPACE</kbd>rec <kbd>P</kbd>play <kbd>O</kbd>stop <kbd>C</kbd>cycle <kbd>H</kbd>home</div>
@@ -165,11 +164,12 @@ function aS(d){
  const cb=document.getElementById('bc');cb.classList.toggle('on',!!d.c);
  cb.innerHTML=d.c?'■ CYCLE LOOP &mdash; ON':'&#9654;&#9654; CYCLE LOOP &mdash; OFF';
  if(typeof d.r==='number')document.getElementById('rs').textContent=d.r+' dBm';
- const wp=document.getElementById('wp');
- if(typeof d.w==='number'&&d.w>0){
-  const names=['','HOME &uarr;','PLAYING','HOME &darr;'];
-  wp.innerHTML='WRAP &mdash; '+names[d.w];wp.style.display='inline-block';
- } else wp.style.display='none';
+ if(typeof d.b==='number'){
+  const FSM=['INIT','HOMING','IDLE','BUSY','FAULT'];
+  const COL=['#666','#3a78c9','#27ae60','#e6a817','#e94560'];
+  const f=document.getElementById('fsm');
+  f.textContent=FSM[d.b]||'?';f.style.background=COL[d.b]||'#444';
+ }
  if(d.c||d.p){
   if(d.i!==lastPlayIdx){lastPlayIdx=d.i;document.querySelectorAll('.pi').forEach((p,k)=>p.classList.toggle('cur',k===d.i-1))}
  } else if(lastPlayIdx!==-1){lastPlayIdx=-1;document.querySelectorAll('.pi').forEach(p=>p.classList.remove('cur'))}
@@ -279,7 +279,7 @@ addEventListener('keydown',e=>{
  else if(k==='p'){w('PY');tt('Play')}
  else if(k==='o'){w('ST');tt('Stop')}
  else if(k==='c'){w('CY');tt('Cycle')}
- else if(k==='h'){w('PR:home');tt('Home')}
+ else if(k==='h'){w('PR:0');tt('Home')}
 });
 addEventListener('keyup',e=>{keys[e.key.toLowerCase()]=false});
 

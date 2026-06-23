@@ -14,13 +14,13 @@ static char posesBuf[3000];
 const char* buildStatus() {
     snprintf(statusBuf, sizeof(statusBuf),
         "{\"t\":\"s\",\"j\":[%d,%d,%d,%d,%d,%d],"
-        "\"m\":%u,\"l\":%d,\"p\":%d,\"c\":%d,\"i\":%d,\"r\":%d,\"w\":%u}",
+        "\"m\":%u,\"l\":%d,\"p\":%d,\"c\":%d,\"i\":%d,\"r\":%d,\"b\":%u}",
         joints[0].cur, joints[1].cur, joints[2].cur,
         joints[3].cur, joints[4].cur, joints[5].cur,
         (unsigned)joyMode, seqLen,
         isPlaying ? 1 : 0, isCycling ? 1 : 0, playIdx,
         (int)WiFi.RSSI(),
-        (unsigned)wrapState);
+        (unsigned)bootState);
     return statusBuf;
 }
 
@@ -66,30 +66,21 @@ void broadcastPresets() {
     ws.textAll(buildPresets());
 }
 
-// Accept "0".."3" or back-compat name; returns 255 on miss.
-static uint8_t parsePresetArg(const char* a) {
-    if (!a) return 255;
-    if (a[0] >= '0' && a[0] <= '9') {
-        int n = atoi(a);
-        return (n >= 0 && n < MAX_PRESETS) ? (uint8_t)n : 255;
-    }
-    if (!strcmp(a, "home"))  return 0;
-    if (!strcmp(a, "ready")) return 1;
-    if (!strcmp(a, "pick"))  return 2;
-    if (!strcmp(a, "place")) return 3;
-    return 255;
-}
-
 // ── WS protocol ─────────────────────────────────────────────────────────────
 // Tags:
 //   JG:j:v             single-axis jog  (-100..100)
 //   JX:j1:v1:j2:v2     dual-axis jog (one XY stick → 2 joints in one frame)
 //   SV:j:a             absolute servo set
-//   PR:name            preset (home/ready/pick/place)
 //   MD:m               HW joystick pair (0..2)
-//   RC / PY / ST / CY / CL / SA / LD   record / play / stop / cycle / clear / save / load
-//   RN:p:name          rename pose
-//   GT:p               goto pose
+//   PR:idx             play preset (0..MAX_PRESETS-1; 1-pose=staged, multi=playback)
+//   SP:idx             save current pose into preset (collapses to 1-pose)
+//   SQ:idx             save current recording into preset as a sequence
+//   PN:idx:name        rename preset
+//   RC                 record current pose into the live sequence
+//   RN:p:name          rename pose in the live sequence
+//   GT:p               goto pose (smooth ramp; no playback)
+//   PY / ST / CY       play / stop / toggle cycle of live sequence
+//   CL / SA / LD       clear / save / load live sequence
 #define TAG(a,b) ((uint16_t)(((a)<<8) | (b)))
 
 void processWsCmd(char* msg) {
@@ -128,14 +119,16 @@ void processWsCmd(char* msg) {
             break;
         }
         case TAG('P','R'): {                             // Play preset (1-pose staged or sequence)
-            uint8_t idx = parsePresetArg(args[0]);
-            if (idx < MAX_PRESETS) playPreset(idx);
+            if (!args[0]) break;
+            int idx = atoi(args[0]);
+            if (idx >= 0 && idx < MAX_PRESETS) playPreset((uint8_t)idx);
             break;
         }
         case TAG('S','P'): {                             // Save current pose to preset (1-pose)
-            uint8_t idx = parsePresetArg(args[0]);
-            if (idx < MAX_PRESETS) {
-                setPresetFromCurrent(idx);
+            if (!args[0]) break;
+            int idx = atoi(args[0]);
+            if (idx >= 0 && idx < MAX_PRESETS) {
+                setPresetFromCurrent((uint8_t)idx);
                 broadcastPresets();
             }
             break;
@@ -161,7 +154,6 @@ void processWsCmd(char* msg) {
             }
             break;
         }
-        case TAG('T','H'): startWrappedPlay(); break;    // Test: Home → recording → Home
         case TAG('M','D'): {
             if (!args[0]) break;
             int m = atoi(args[0]);
@@ -302,10 +294,57 @@ void onWsEvent(AsyncWebSocket*, AsyncWebSocketClient* client,
 }
 
 // ── Serial command processor ────────────────────────────────────────────────
+static const char* BOOT_NAMES[] = { "INIT", "HOMING", "IDLE", "BUSY", "FAULT" };
+
+static void printHelp() {
+    Serial.println();
+    Serial.println(F("─── RoboArm serial — quick commands ───────────────────"));
+    Serial.println(F("  0 1 2 3  play preset (0=Home 1=Ready 2=Pick 3=Place)"));
+    Serial.println(F("  H        home (= preset 0)"));
+    Serial.println(F("  R        record current pose"));
+    Serial.println(F("  P        play / S stop / C cycle toggle"));
+    Serial.println(F("  K        clear recording"));
+    Serial.println(F("  V        save to flash / L load from flash"));
+    Serial.println(F("  ?        this help"));
+    Serial.println(F("─── Long form ─────────────────────────────────────────"));
+    Serial.println(F("  STATUS              FSM state + joints + WiFi"));
+    Serial.println(F("  PRESET <0-3>        same as the digit shortcut"));
+    Serial.println(F("  RENAME <0-3> <nm>   rename a preset (UPPERCASE)"));
+    Serial.println(F("  S <j> <a>           set joint j to angle a (smooth)"));
+    Serial.println(F("  INVERT <j>          toggle joint direction"));
+    Serial.println(F("  SPEED [deg/sec]     get/set motion engine speed"));
+    Serial.println(F("  TEST                lo→home→hi sweep per joint"));
+    Serial.println(F("─── Calibration ───────────────────────────────────────"));
+    Serial.println(F("  RAW <j> <counts>           direct PCA9685 write"));
+    Serial.println(F("  SWEEP <j> <s> <e> [step]   1.5 s/step counts ramp"));
+    Serial.println(F("  CALSHOW                    show calibration table"));
+    Serial.println();
+}
+
 void processSerial() {
     if (!Serial.available()) return;
     String cmd = Serial.readStringUntil('\n');
     cmd.trim(); cmd.toUpperCase();
+    if (cmd.length() == 0) return;
+
+    // ── Single-char shortcuts ────────────────────────────────────────────
+    if (cmd.length() == 1) {
+        char c = cmd[0];
+        switch (c) {
+            case '?': printHelp();                                       return;
+            case 'H': playPreset(0);                                     return;
+            case 'R': recordPose();                                      return;
+            case 'P': startPlayback();                                   return;
+            case 'S': stopPlayback();                                    return;
+            case 'C': isCycling ? stopCycle() : startCycle();            return;
+            case 'K': clearRecording();                                  return;
+            case 'V': saveToFlash();                                     return;
+            case 'L': loadFromFlash();                                   return;
+            case '0': case '1': case '2': case '3':
+                playPreset((uint8_t)(c - '0'));                          return;
+        }
+        // Single letter that didn't match — fall through to unknown handler
+    }
 
     if (cmd.startsWith("S ")) {
         int s1 = cmd.indexOf(' '), s2 = cmd.indexOf(' ', s1 + 1);
@@ -349,17 +388,6 @@ void processSerial() {
             }
         }
     }
-    else if (cmd == "HOME")  { applyPreset(POSE_HOME);  pendingBroadcast = true; }
-    else if (cmd == "READY") { applyPreset(POSE_READY); pendingBroadcast = true; }
-    else if (cmd == "PICK")  { applyPreset(POSE_PICK);  pendingBroadcast = true; }
-    else if (cmd == "PLACE") { applyPreset(POSE_PLACE); pendingBroadcast = true; }
-    else if (cmd == "REC")   recordPose();
-    else if (cmd == "PLAY")  startPlayback();
-    else if (cmd == "STOP")  stopPlayback();
-    else if (cmd == "CYCLE") isCycling ? stopCycle() : startCycle();
-    else if (cmd == "CLEAR") clearRecording();
-    else if (cmd == "SAVE")  saveToFlash();
-    else if (cmd == "LOAD")  loadFromFlash();
     else if (cmd.startsWith("PRESET")) {
         if (cmd.length() <= 6) {
             Serial.println("Usage: PRESET <0-3>");
@@ -368,9 +396,6 @@ void processSerial() {
             if (idx >= 0 && idx < MAX_PRESETS) playPreset((uint8_t)idx);
             else Serial.println("Preset 0-3");
         }
-    }
-    else if (cmd == "WRAP") {
-        startWrappedPlay();
     }
     else if (cmd.startsWith("RENAME")) {
         // RENAME <idx> <name>  — note: cmd is already uppercased by processSerial
@@ -391,6 +416,11 @@ void processSerial() {
         }
     }
     else if (cmd == "STATUS") {
+        Serial.printf("== FSM == %s", BOOT_NAMES[bootState]);
+        if (bootState == STATE_FAULT) Serial.print("  (motion gated off)");
+        else if (bootState == STATE_BUSY) Serial.printf("  (%s)",
+            presetActive ? "preset" : isCycling ? "cycle" : "playback");
+        Serial.println();
         Serial.println("-- Joints --");
         for (int i = 0; i < 6; i++)
             Serial.printf("  %d. %-14s ch%-2d  %3d deg  invert=%s\n",
@@ -465,14 +495,17 @@ void processSerial() {
         }
         Serial.println("[SWEEP] Done");
     }
-    else if (cmd == "HELP") {
-        Serial.println("S <j> <a> | INVERT <j> | TEST | HOME/READY/PICK/PLACE");
-        Serial.println("REC | PLAY | STOP | CYCLE | CLEAR | SAVE | LOAD | STATUS");
-        Serial.println("SPEED [deg/sec]   - smooth motion ramp rate (default 40)");
-        Serial.println("PRESET <0-3>      - play preset (1-pose staged, multi-pose playback)");
-        Serial.println("RENAME <0-3> <nm> - rename preset (uppercase via serial)");
-        Serial.println("WRAP              - Home -> live recording -> Home (test)");
-        Serial.println("RAW <j> <counts> | SWEEP <j> <start> <end> [step] | CALSHOW");
+    else if (cmd == "HELP") printHelp();
+    // ── Long-form aliases for the legacy verbs (REC/PLAY/STOP/...) ─────────
+    else if (cmd == "REC")    recordPose();
+    else if (cmd == "PLAY")   startPlayback();
+    else if (cmd == "STOP")   stopPlayback();
+    else if (cmd == "CYCLE")  isCycling ? stopCycle() : startCycle();
+    else if (cmd == "CLEAR")  clearRecording();
+    else if (cmd == "SAVE")   saveToFlash();
+    else if (cmd == "LOAD")   loadFromFlash();
+    else {
+        Serial.printf("Unknown: '%s'\n", cmd.c_str());
+        printHelp();
     }
-    else if (cmd.length() > 0) Serial.println("Unknown. HELP.");
 }

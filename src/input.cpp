@@ -24,7 +24,7 @@ bool     webJogActive = false;
 static uint32_t lastSW = 0, lastRec = 0, lastPlay = 0, lastClr = 0, lastCycle = 0;
 
 // ── HW joystick ─────────────────────────────────────────────────────────────
-void calibrateJoystick() {
+bool calibrateJoystick() {
     long xs = 0, ys = 0;
     const int N = 64;
     for (int i = 0; i < N; i++) {
@@ -34,7 +34,14 @@ void calibrateJoystick() {
     }
     joyXCenter = xs / N;
     joyYCenter = ys / N;
-    Serial.printf("[JOY] Center X=%d Y=%d\n", joyXCenter, joyYCenter);
+
+    // Sanity: 12-bit ADC centered on a 3.3V/2 divider should land near 2048.
+    // Pinned-to-rail (0 or 4095) means a broken pot or shorted wire.
+    bool ok = (joyXCenter >= 1600 && joyXCenter <= 2500 &&
+               joyYCenter >= 1600 && joyYCenter <= 2500);
+    Serial.printf("[JOY] Center X=%d Y=%d  %s\n",
+                  joyXCenter, joyYCenter, ok ? "OK" : "OUT OF RANGE");
+    return ok;
 }
 
 void processJoystick() {

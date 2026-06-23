@@ -27,6 +27,7 @@ const char* WIFI_SSID = "ASEM Training";
 const char* WIFI_PASS = "Class@Asem";
 
 // ─── Singleton definitions (extern'd in globals.h) ──────────────────────────
+BootState               bootState  = STATE_INIT;
 Adafruit_PWMServoDriver pca9685(PCA9685_ADDR);
 AsyncWebServer          server(80);
 AsyncWebSocket          ws("/ws");
@@ -45,15 +46,36 @@ void setup() {
     servoMutex = xSemaphoreCreateMutex();
     wsQueue    = xQueueCreate(32, sizeof(WsMsg));
 
+    // ── STATE_INIT: full self-audit ─────────────────────────────────────────
+    bootState = STATE_INIT;
+    Serial.println("[INIT] STATE_INIT — running self-audit");
     Wire.begin(I2C_SDA, I2C_SCL);
-    pca9685.begin();
-    pca9685.setOscillatorFrequency(OSC_FREQ);
-    pca9685.setPWMFreq(PWM_FREQ_HZ);
-    delay(10);
-    Serial.println("[PCA9685] OK");
 
-    moveToSafePosition();
-    Serial.println("[Servos] Safe position reached");
+    // 1. I²C ACK probe: detects missing/unpowered PCA9685
+    Wire.beginTransmission(PCA9685_ADDR);
+    uint8_t ack = Wire.endTransmission();
+    bool i2cOk = (ack == 0);
+    Serial.printf("[INIT] (1/3) I2C ACK on 0x%02X: %s",
+                  PCA9685_ADDR, i2cOk ? "OK\n" : "");
+    if (!i2cOk) {
+        Serial.printf("FAIL (err=%u)\n", ack);
+        bootState = STATE_FAULT;
+    }
+
+    // 2. PCA9685 per-channel write/readback: detects dead channels / wrong chip
+    bool channelsOk = false;
+    if (bootState != STATE_FAULT) {
+        pca9685.begin();
+        pca9685.setOscillatorFrequency(OSC_FREQ);
+        pca9685.setPWMFreq(PWM_FREQ_HZ);
+        delay(10);
+        Serial.println("[INIT] (2/3) PCA9685 configured");
+        channelsOk = selfTestServoChannels();
+        if (!channelsOk) {
+            Serial.println("[INIT] FAULT: one or more PCA9685 channels misbehaving");
+            bootState = STATE_FAULT;
+        }
+    }
 
     pinMode(JOY_SW_PIN,    INPUT_PULLUP);
     pinMode(BTN_REC_PIN,   INPUT_PULLUP);
@@ -61,10 +83,27 @@ void setup() {
     pinMode(BTN_CLR_PIN,   INPUT_PULLUP);
     pinMode(BTN_CYCLE_PIN, INPUT_PULLUP);
 
-    calibrateJoystick();
-    loadPresetsFromFlash();
+    // 3. Joystick sanity: pinned-to-rail center means broken pot or shorted wire
+    bool joyOk = calibrateJoystick();
+    Serial.printf("[INIT] (3/3) Joystick centers: %s\n", joyOk ? "OK" : "OUT OF RANGE");
+    if (!joyOk && bootState != STATE_FAULT) {
+        Serial.println("[INIT] WARN: joystick degraded — continuing (web UI still works)");
+        // Non-fatal: web UI can drive the arm without the HW stick.
+    }
 
+    loadPresetsFromFlash();
     loadFromFlash();
+
+    // ── STATE_HOMING: Wrist → Elbow → Shoulder → Base to Home ──────────────
+    if (bootState != STATE_FAULT) {
+        bootState = STATE_HOMING;
+        Serial.println("[INIT] STATE_HOMING -> Home pose");
+        moveToHomePose();
+        bootState = STATE_IDLE;
+        Serial.println("[INIT] STATE_IDLE — type ? for serial help");
+    } else {
+        Serial.println("[INIT] Skipping homing — audit failed. WiFi/UI still up.");
+    }
 
     WiFi.mode(WIFI_STA);
     WiFi.begin(WIFI_SSID, WIFI_PASS);
@@ -96,13 +135,27 @@ void loop() {
     WsMsg m;
     while (xQueueReceive(wsQueue, &m, 0)) processWsCmd(m.buf);
 
-    processJoystick();
-    processWebJog();
-    processButtons();
-    processPlayback();
-    processPresetMove();      // advances staged preset moves between phases
-    processWrap();            // advances the home → recording → home test
-    processMotion();          // ramps servoCur -> servoTarget at motionSpeed
+    // STATE_FAULT: skip every motion path. WS + serial stay alive so the user
+    // sees the fault on the UI and can issue a STATUS / RAW probe over serial.
+    if (bootState != STATE_FAULT) {
+        processJoystick();
+        processWebJog();
+        processButtons();
+        processPlayback();
+        processPresetMove();  // advances staged preset moves between phases
+        processMotion();      // ramps servoCur -> servoTarget at motionSpeed
+
+        // Recompute IDLE ↔ BUSY each tick. Only consider transitions once
+        // homing is finished — INIT/HOMING/FAULT stay put.
+        if (bootState == STATE_IDLE || bootState == STATE_BUSY) {
+            BootState target = (presetActive || isPlaying || isCycling)
+                             ? STATE_BUSY : STATE_IDLE;
+            if (target != bootState) {
+                bootState = target;
+                pendingBroadcast = true;
+            }
+        }
+    }
     processSerial();
 
     static uint32_t lastCleanupMs = 0;

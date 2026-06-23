@@ -36,7 +36,8 @@
 #define PLAY_STEP_MS 3000       // 3s/pose, enough for 120° move at 40°/s
 
 // ── Staged motion (soft-home + preset moves)
-#define SOFT_HOME_SETTLE_MS  1000   // pause between joints in setup() boot sequence
+#define SOFT_HOME_STEP_MS    25     // ms per 1° step during boot ramp = 40°/s
+#define SOFT_HOME_SETTLE_MS  600    // pause AFTER each joint finishes its ramp
 #define PRESET_SPEED_DEG_S   40.0f  // motionSpeed override while a preset is staging
 #define PRESET_SETTLE_DEG    0.5f   // |target-cur| threshold for "phase done"
 
@@ -64,3 +65,11 @@ struct Preset {
 };
 
 struct WsMsg { char buf[96]; };
+
+// ── Boot FSM (services the "Startup Protocol" spec) ─────────────────────────
+//   STATE_INIT    — power-up self-audit: I²C ACK, per-channel readback, joy sanity
+//   STATE_HOMING  — staged Wrist → Elbow → Shoulder → Base move to Home pose
+//   STATE_IDLE    — at Home, no motion in flight, waiting for input
+//   STATE_BUSY    — preset move / playback / cycle is in progress
+//   STATE_FAULT   — self-audit failed; WiFi/UI still up so the fault is visible
+enum BootState : uint8_t { STATE_INIT, STATE_HOMING, STATE_IDLE, STATE_BUSY, STATE_FAULT };

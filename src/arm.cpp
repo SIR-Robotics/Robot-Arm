@@ -28,9 +28,8 @@ bool     isCycling  = false;
 int      playIdx    = 0;
 uint32_t playNextMs = 0;
 
-Pose*     playSrc    = nullptr;
-int       playSrcLen = 0;
-WrapState wrapState  = WRAP_IDLE;
+Pose* playSrc    = nullptr;
+int   playSrcLen = 0;
 
 Preset presets[MAX_PRESETS] = {
     { "Home",  1, { { { 129, 62, 86, 86, 86,  0 }, "" } } },
@@ -38,12 +37,6 @@ Preset presets[MAX_PRESETS] = {
     { "Pick",  1, { { {  90, 45, 45, 90, 90,  0 }, "" } } },
     { "Place", 1, { { {  90, 45, 45, 90, 90, 90 }, "" } } },
 };
-
-// Backward-compat aliases — Stage B refactors callers to use presets[].
-int* POSE_HOME  = presets[0].seq[0].a;
-int* POSE_READY = presets[1].seq[0].a;
-int* POSE_PICK  = presets[2].seq[0].a;
-int* POSE_PLACE = presets[3].seq[0].a;
 
 // ── Servo math ──────────────────────────────────────────────────────────────
 uint16_t toCounts(const Joint& j, int angle) {
@@ -79,10 +72,6 @@ void sendPWM(uint8_t i, int angle) {
     pca9685.setPWM(joints[i].ch, 0, toCounts(joints[i], phys));
 }
 
-void moveToHome() {
-    for (int i = 0; i < 6; i++) setServoNow(i, joints[i].home);
-}
-
 // ── Soft-home: staged 1°/step ramp run from setup() before the server opens ──
 // Phase order (end-effector → base) for collision avoidance:
 //   1. Clearance: gripper, wrist roll, wrist pitch  — retract the tool first.
@@ -99,16 +88,22 @@ void moveToHome() {
 // guarantees the slews don't happen simultaneously (power-supply spike, and
 // uncoordinated arc collisions). Use sendPWM() because setup() is the only
 // thread running on this core right now — no async tasks, no motion engine.
-static void sendJointToHome(uint8_t j) {
-    int target = joints[j].home;
+static void sendJointTo(uint8_t j, int target) {
+    target = constrain(target, joints[j].lo, joints[j].hi);
+    int start = joints[j].cur;
 
-    Serial.printf("  %-12s ch%-2d  -> %3d deg\n",
-                  joints[j].name, joints[j].ch, target);
+    Serial.printf("  %-12s ch%-2d  %3d -> %3d deg (%d deg)\n",
+                  joints[j].name, joints[j].ch, start, target, abs(target - start));
 
-    // Single pulse to home. Servo slews from wherever it actually is at
-    // its own max rate. Hold long enough for it to arrive before the next
-    // joint's pulse goes out, so staging is visible.
-    sendPWM(j, target);
+    // Walk 1°/step at SOFT_HOME_STEP_MS per degree. Servo follows the staged
+    // pulses instead of slewing at its own max rate, so the boot move is
+    // visible and matches motionSpeed (40°/s). Motion engine isn't running
+    // yet (we're still in setup()), so the bus is ours — sendPWM is safe.
+    int step = (target > start) ? 1 : (target < start) ? -1 : 0;
+    for (int a = start; a != target; a += step) {
+        sendPWM(j, a + step);
+        delay(SOFT_HOME_STEP_MS);
+    }
     delay(SOFT_HOME_SETTLE_MS);
 
     joints[j].cur  = target;
@@ -127,18 +122,59 @@ static const uint8_t* PHASE_JOINTS[3]    = {
 };
 static const char*    PHASE_NAMES[3]     = { "Clearance", "Elevation", "Alignment" };
 
-void moveToSafePosition() {
+void moveToPose(const int p[6]) {
     // Stage commands one joint at a time, in clearance → elevation →
-    // alignment order. Each joint gets one pulse to home; SOFT_HOME_SETTLE_MS
-    // separates them so the servos don't all slew at once (power-supply
-    // spike) and so the user sees a deliberate boot sequence. The servos
-    // themselves slew at their own max rate from wherever they actually are.
-    for (uint8_t p = 0; p < 3; p++) {
-        Serial.printf("[HOME] Soft-home: %s\n", PHASE_NAMES[p]);
-        for (uint8_t k = 0; k < PHASE_SIZES[p]; k++)
-            sendJointToHome(PHASE_JOINTS[p][k]);
+    // alignment order. Each joint gets one pulse to its target angle in p[];
+    // SOFT_HOME_SETTLE_MS separates them so the servos don't all slew at once
+    // (power-supply spike) and the user sees a deliberate boot sequence. The
+    // servos themselves slew at their own max rate from wherever they are.
+    for (uint8_t ph = 0; ph < 3; ph++) {
+        Serial.printf("[BOOT] Phase: %s\n", PHASE_NAMES[ph]);
+        for (uint8_t k = 0; k < PHASE_SIZES[ph]; k++) {
+            uint8_t j = PHASE_JOINTS[ph][k];
+            sendJointTo(j, p[j]);
+        }
     }
-    Serial.println("[HOME] Soft-home complete");
+    Serial.println("[BOOT] Pose reached");
+}
+
+void moveToSafePosition() {
+    int homePose[6];
+    for (int i = 0; i < 6; i++) homePose[i] = joints[i].home;
+    moveToPose(homePose);
+}
+
+void moveToHomePose() {
+    // Boot target = presets[0] ("Home"). User-renamable, so re-teaching the
+    // Home preset from the UI changes the boot landing without a reflash.
+    moveToPose(presets[0].seq[0].a);
+}
+
+// ── Per-channel PCA9685 write/readback self-test ────────────────────────────
+// Catches: dead PCA9685, wrong chip at 0x40, I²C corruption on a specific
+// channel, mid-boot I²C glitches. DOES NOT catch a pulled servo wire — the
+// chip will happily store a duty cycle for a channel whose connector is
+// dangling. For real per-servo detection you need rail current sensing.
+// We probe just the 6 channels we actually drive; reads use the Adafruit
+// lib's getPWM(), writes use setPWM(). Restore each channel to 0 (off) after
+// the probe so we don't leave stale duty cycles before the homing ramp.
+bool selfTestServoChannels() {
+    const uint16_t TEST_OFF = 0x0AAA;     // arbitrary pattern, distinct from 0/4095
+    bool allOk = true;
+    Serial.println("[INIT] PCA9685 channel readback:");
+    for (uint8_t i = 0; i < 6; i++) {
+        uint8_t ch = joints[i].ch;
+        pca9685.setPWM(ch, 0, TEST_OFF);
+        delayMicroseconds(200);                    // let the I²C write settle
+        uint16_t off = pca9685.getPWM(ch, true);   // true = read OFF register
+        bool ok = (off == TEST_OFF);
+        Serial.printf("  ch%-2d (%-12s) wrote=0x%04X read=0x%04X  %s\n",
+                      ch, joints[i].name, TEST_OFF, off, ok ? "PASS" : "FAIL");
+        if (!ok) allOk = false;
+        pca9685.setPWM(ch, 0, 0);                  // park channel off before homing
+    }
+    Serial.printf("[INIT] Channel readback: %s\n", allOk ? "ALL PASS" : "FAILURES");
+    return allOk;
 }
 
 // ── Staged preset move (async, runs through the motion engine) ──────────────
@@ -292,19 +328,13 @@ void loadFromFlash() {
 
 // ── Teachable presets ──────────────────────────────────────────────────────
 void setPresetFromCurrent(uint8_t idx) {
-    int* p = nullptr;
-    const char* name = "";
-    switch (idx) {
-        case 0: p = POSE_HOME;  name = "home";  break;
-        case 1: p = POSE_READY; name = "ready"; break;
-        case 2: p = POSE_PICK;  name = "pick";  break;
-        case 3: p = POSE_PLACE; name = "place"; break;
-        default: return;
-    }
+    if (idx >= MAX_PRESETS) return;
+    int* p = presets[idx].seq[0].a;
     for (int i = 0; i < 6; i++) p[i] = joints[i].cur;
     presets[idx].len = 1;          // teaching a single pose collapses the slot
     savePresetsToFlash();
-    Serial.printf("[PRESET] %s = [%d %d %d %d %d %d]\n", name,
+    Serial.printf("[PRESET %u \"%s\"] taught: [%d %d %d %d %d %d]\n",
+        (unsigned)idx, presets[idx].name,
         p[0], p[1], p[2], p[3], p[4], p[5]);
 }
 
@@ -336,54 +366,6 @@ void playPreset(uint8_t idx) {
         pendingBroadcast = true;
         Serial.printf("[PRESET %u \"%s\"] playing %d poses\n",
                       (unsigned)idx, presets[idx].name, presets[idx].len);
-    }
-}
-
-// Wrap test: Home → live recording → Home. Polled from loop() via processWrap.
-// Refuses to start if any motion is already in progress.
-void startWrappedPlay() {
-    if (wrapState != WRAP_IDLE) {
-        Serial.println("[WRAP] Already running");
-        return;
-    }
-    if (seqLen == 0) {
-        Serial.println("[WRAP] Live recording is empty");
-        return;
-    }
-    if (isPlaying || isCycling || presetActive) {
-        Serial.println("[WRAP] Motion in progress — cancel first");
-        return;
-    }
-    Serial.println("[WRAP] Step 1/3: Home");
-    wrapState = WRAP_HOMING_PRE;
-    playPreset(0);                      // preset 0 = Home; handles 1- or multi-pose
-    pendingBroadcast = true;
-}
-
-void processWrap() {
-    if (wrapState == WRAP_IDLE) return;
-
-    // A step is "done" when no motion engine has work left for it.
-    bool motionIdle = !presetActive && !isPlaying && !isCycling;
-    if (!motionIdle) return;
-
-    switch (wrapState) {
-        case WRAP_HOMING_PRE:
-            Serial.println("[WRAP] Step 2/3: Playing recording");
-            wrapState = WRAP_PLAYING_REC;
-            startPlayback();
-            break;
-        case WRAP_PLAYING_REC:
-            Serial.println("[WRAP] Step 3/3: Returning to Home");
-            wrapState = WRAP_HOMING_POST;
-            playPreset(0);
-            break;
-        case WRAP_HOMING_POST:
-            Serial.println("[WRAP] Complete");
-            wrapState = WRAP_IDLE;
-            pendingBroadcast = true;
-            break;
-        default: break;
     }
 }
 

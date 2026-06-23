@@ -10,7 +10,7 @@ extern int     webJog[6];        // -100..+100 per joint, set by web/gamepad
 extern const uint8_t  PAIR[3][2];
 extern const char*    PAIR_NAME[3];
 
-void calibrateJoystick();
+bool calibrateJoystick();        // true = centers landed in sane range [1600,2500]
 void processJoystick();
 void processButtons();
 void processWebJog();

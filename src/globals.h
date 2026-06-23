@@ -10,6 +10,9 @@
 #include "freertos/semphr.h"
 #include "freertos/queue.h"
 
+#include "config.h"
+
+extern BootState bootState;
 extern Adafruit_PWMServoDriver pca9685;
 extern AsyncWebServer          server;
 extern AsyncWebSocket          ws;

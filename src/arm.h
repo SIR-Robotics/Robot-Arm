@@ -22,28 +22,18 @@ extern uint32_t playNextMs;
 extern Pose* playSrc;
 extern int   playSrcLen;
 
-// Wrap test: Home → live recording → Home.
-enum WrapState { WRAP_IDLE, WRAP_HOMING_PRE, WRAP_PLAYING_REC, WRAP_HOMING_POST };
-extern WrapState wrapState;
-
 // Sequence-capable preset slots. Each can hold up to MAX_POSES_PER_PRESET poses.
 extern Preset presets[MAX_PRESETS];
-
-// Stage-A compat aliases — point at preset[i].seq[0].a so existing code
-// (applyPreset, setPresetFromCurrent, the PR tag, the serial HOME/READY/PICK/
-// PLACE commands) keeps working unchanged. Stage B will refactor callers.
-extern int* POSE_HOME;
-extern int* POSE_READY;
-extern int* POSE_PICK;
-extern int* POSE_PLACE;
 
 // ── Servo
 uint16_t toCounts(const Joint& j, int angle);
 void     setServo   (uint8_t i, int angle);   // smooth — sets servoTarget[i]
 void     setServoNow(uint8_t i, int angle);   // immediate I2C write (startup, RAW, TEST)
 void     sendPWM    (uint8_t i, int angle);   // raw fast path (no mutex — caller owns bus)
-void     moveToHome();
-void     moveToSafePosition();
+void     moveToPose(const int p[6]);          // blocking, staged: Clearance → Elev → Align
+void     moveToSafePosition();                // wrapper: targets joints[].home
+void     moveToHomePose();                    // wrapper: targets presets[0] (Home)
+bool     selfTestServoChannels();             // PCA9685 per-channel write/readback (true=all pass)
 void     applyPreset(const int p[6]);         // staged + slow; uses motion engine
 void     processMotion();                     // advances servoCur -> servoTarget every tick
 void     processPresetMove();                 // drives the async preset state machine
@@ -67,5 +57,3 @@ void saveToFlash();
 void loadFromFlash();
 void processPlayback();
 void playPreset(uint8_t idx);                 // 1-pose → staged move; multi-pose → playback
-void startWrappedPlay();                      // Home → live recording → Home
-void processWrap();                           // poller in loop()
