@@ -1,6 +1,7 @@
 // ─── arm.cpp — Joint table, smooth motion engine, recording, playback ───────
 #include "arm.h"
 #include "globals.h"
+#include "startup_pwm.h"
 #include <math.h>
 
 // ── Joint table ─────────────────────────────────────────────────────────────
@@ -69,6 +70,61 @@ void sendPWM(uint8_t i, int angle) {
 
 void moveToHome() {
     for (int i = 0; i < 6; i++) setServoNow(i, joints[i].home);
+}
+
+static void writePwmCounts(const uint16_t counts[6]) {
+    xSemaphoreTake(servoMutex, portMAX_DELAY);
+    for (uint8_t channel = 0; channel < 6; ++channel) {
+        pca9685.setPWM(channel, 0, counts[channel]);
+    }
+    xSemaphoreGive(servoMutex);
+}
+
+static void rampPwmChannels(uint16_t current[6], const uint16_t target[6],
+                            const uint8_t channels[], uint8_t channelCount) {
+    bool moved;
+    do {
+        moved = false;
+        xSemaphoreTake(servoMutex, portMAX_DELAY);
+        for (uint8_t i = 0; i < channelCount; ++i) {
+            uint8_t channel = channels[i];
+            uint16_t next = stepPwmToward(current[channel], target[channel]);
+            if (next == current[channel]) continue;
+            current[channel] = next;
+            pca9685.setPWM(channel, 0, next);
+            moved = true;
+        }
+        xSemaphoreGive(servoMutex);
+        if (moved) delay(30);  // one PWM count per channel, about 15 deg/sec
+    } while (moved);
+}
+
+void moveToSafePosition() {
+    static const uint16_t startPwmByChannel[6] = {300, 400, 300, 300, 300, 300};
+    static const uint16_t safePwmByChannel[6]  = {400, 300, 300, 300, 300, 300};
+    static const uint8_t clearanceChannels[] = {2, 3, 4};
+    static const uint8_t elevationChannels[] = {0, 1};
+    static const uint8_t alignmentChannels[] = {5};
+    uint16_t current[6];
+
+    for (uint8_t channel = 0; channel < 6; ++channel) {
+        current[channel] = startPwmByChannel[channel];
+    }
+    writePwmCounts(current);
+
+    rampPwmChannels(current, safePwmByChannel, clearanceChannels, 3);
+    rampPwmChannels(current, safePwmByChannel, elevationChannels, 2);
+    rampPwmChannels(current, safePwmByChannel, alignmentChannels, 1);
+    writePwmCounts(safePwmByChannel);
+
+    for (uint8_t i = 0; i < 6; ++i) {
+        const Joint& joint = joints[i];
+        int angle = pwmCountToLogicalAngle(safePwmByChannel[joint.ch],
+                                            joint.lo, joint.hi, joint.invert);
+        joints[i].cur = angle;
+        servoCur[i] = (float)angle;
+        servoTarget[i] = (float)angle;
+    }
 }
 
 void applyPreset(const int p[6]) {

@@ -5,4 +5,10 @@
 .vscode/ipch
 .claude
 CLAUDE.md
+=======
 .agents
+skills-lock.json
+.forge
+docs
+test
+>>>>>>> f422a3bacb2d4461ebafbc406b8d3bdfe7cbf638
