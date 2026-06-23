@@ -5,3 +5,8 @@
 .vscode/ipch
 .claude
 CLAUDE.md
+.agents
+skills-lock.json
+.forge
+docs
+test

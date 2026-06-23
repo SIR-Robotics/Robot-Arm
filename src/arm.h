@@ -29,6 +29,7 @@ void     setServo   (uint8_t i, int angle);   // smooth — sets servoTarget[i]
 void     setServoNow(uint8_t i, int angle);   // immediate I2C write (startup, RAW, TEST)
 void     sendPWM    (uint8_t i, int angle);   // raw fast path (no mutex — caller owns bus)
 void     moveToHome();
+void     moveToSafePosition();
 void     applyPreset(const int p[6]);
 void     processMotion();                     // advances servoCur -> servoTarget every tick
 

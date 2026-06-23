@@ -52,6 +52,9 @@ void setup() {
     delay(10);
     Serial.println("[PCA9685] OK");
 
+    moveToSafePosition();
+    Serial.println("[Servos] Safe position reached");
+
     pinMode(JOY_SW_PIN,    INPUT_PULLUP);
     pinMode(BTN_REC_PIN,   INPUT_PULLUP);
     pinMode(BTN_PLAY_PIN,  INPUT_PULLUP);
@@ -60,8 +63,6 @@ void setup() {
 
     calibrateJoystick();
     loadPresetsFromFlash();
-    moveToHome();
-    Serial.println("[Servos] Home");
 
     loadFromFlash();
 
