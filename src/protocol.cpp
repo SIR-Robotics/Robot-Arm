@@ -102,7 +102,7 @@ void processWsCmd(char* msg) {
             else if (!strcmp(args[0], "ready")) p = POSE_READY;
             else if (!strcmp(args[0], "pick"))  p = POSE_PICK;
             else if (!strcmp(args[0], "place")) p = POSE_PLACE;
-            if (p) { for (int i = 0; i < 6; i++) setServo(i, p[i]); pendingBroadcast = true; }
+            if (p) applyPreset(p);   // staged + slow
             break;
         }
         case TAG('S','P'): {                             // Set Preset from current

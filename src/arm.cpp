@@ -1,24 +1,23 @@
 // ─── arm.cpp — Joint table, smooth motion engine, recording, playback ───────
 #include "arm.h"
 #include "globals.h"
-#include "startup_pwm.h"
 #include <math.h>
 
 // ── Joint table ─────────────────────────────────────────────────────────────
 // minUs/maxUs are physical pulse-width calibration; counts derived per-tick.
 Joint joints[6] = {
     //  name           ch   lo   hi  home  cur   inv   minUs maxUs
-    { "Base",           5,   0, 270, 135, 135,  false,  500, 2500 },
-    { "Shoulder",       0,  30, 150,  90,  90,  true,   500, 2500 },
-    { "Elbow",          1,   0, 180,  90,  90,  false,  500, 2500 },
-    { "Wrist Pitch",    2,   0, 180,  90,  90,  false,  500, 2500 },
-    { "Wrist Roll",     3,   0, 180,  90,  90,  false,  500, 2500 },
-    { "Gripper",        4,   0,  90,  45,  45,  false,  500, 2500 },
+    { "Base",           5,   0, 270, 129, 129,  false,  342, 2686 },
+    { "Shoulder",       0,  30, 150,  62,  62,  true,   342, 2539 },
+    { "Elbow",          1,   0, 180,  86,  86,  false,  342, 2686 },
+    { "Wrist Pitch",    2,   0, 180,  86,  86,  false,  342, 2686 },
+    { "Wrist Roll",     3,   0, 180,  86,  86,  false,  342, 2686 },
+    { "Gripper",        4,   0,  90,   0,   0,  false,  342, 1514 },
 };
 
 // ── Smooth motion state
-float servoCur[6]    = {135, 90, 90, 90, 90, 45};
-float servoTarget[6] = {135, 90, 90, 90, 90, 45};
+float servoCur[6]    = {129, 62, 86, 86, 86, 0};
+float servoTarget[6] = {129, 62, 86, 86, 86, 0};
 float motionSpeed    = 120.0f;        // deg/sec — ~0.75s for a 90° move
 
 // ── Recording state
@@ -29,7 +28,7 @@ bool     isCycling  = false;
 int      playIdx    = 0;
 uint32_t playNextMs = 0;
 
-int POSE_HOME [6] = { 90, 90, 90, 90, 90, 45 };
+int POSE_HOME [6] = { 129, 62, 86, 86, 86, 0 };
 int POSE_READY[6] = { 90, 60, 90, 90, 90, 45 };
 int POSE_PICK [6] = { 90, 45, 45, 90, 90,  0 };
 int POSE_PLACE[6] = { 90, 45, 45, 90, 90, 90 };
@@ -72,63 +71,116 @@ void moveToHome() {
     for (int i = 0; i < 6; i++) setServoNow(i, joints[i].home);
 }
 
-static void writePwmCounts(const uint16_t counts[6]) {
-    xSemaphoreTake(servoMutex, portMAX_DELAY);
-    for (uint8_t channel = 0; channel < 6; ++channel) {
-        pca9685.setPWM(channel, 0, counts[channel]);
-    }
-    xSemaphoreGive(servoMutex);
+// ── Soft-home: staged 1°/step ramp run from setup() before the server opens ──
+// Phase order (end-effector → base) for collision avoidance:
+//   1. Clearance: gripper, wrist roll, wrist pitch  — retract the tool first.
+//   2. Elevation: elbow, shoulder                   — lift the arm body.
+//   3. Alignment: base                              — rotate to center last.
+// Per joint we ramp from joints[].cur (best-known position; on cold boot this
+// equals .home so the inner loop is a no-op and we just emit one settling
+// pulse per joint, staggered). When the firmware reboots mid-session the cur
+// value may differ from home; this ramp then walks 1° at a time at ~67°/s.
+//
+// Limitation: there are no encoders. If the arm was physically moved while
+// powered off, the first pulse for each joint will still command home and the
+// servo will slew to it at its own max speed. The phase staging at least
+// guarantees the slews don't happen simultaneously (power-supply spike, and
+// uncoordinated arc collisions). Use sendPWM() because setup() is the only
+// thread running on this core right now — no async tasks, no motion engine.
+static void sendJointToHome(uint8_t j) {
+    int target = joints[j].home;
+
+    Serial.printf("  %-12s ch%-2d  -> %3d deg\n",
+                  joints[j].name, joints[j].ch, target);
+
+    // Single pulse to home. Servo slews from wherever it actually is at
+    // its own max rate. Hold long enough for it to arrive before the next
+    // joint's pulse goes out, so staging is visible.
+    sendPWM(j, target);
+    delay(SOFT_HOME_SETTLE_MS);
+
+    joints[j].cur  = target;
+    servoCur[j]    = (float)target;
+    servoTarget[j] = (float)target;
 }
 
-static void rampPwmChannels(uint16_t current[6], const uint16_t target[6],
-                            const uint8_t channels[], uint8_t channelCount) {
-    bool moved;
-    do {
-        moved = false;
-        xSemaphoreTake(servoMutex, portMAX_DELAY);
-        for (uint8_t i = 0; i < channelCount; ++i) {
-            uint8_t channel = channels[i];
-            uint16_t next = stepPwmToward(current[channel], target[channel]);
-            if (next == current[channel]) continue;
-            current[channel] = next;
-            pca9685.setPWM(channel, 0, next);
-            moved = true;
-        }
-        xSemaphoreGive(servoMutex);
-        if (moved) delay(30);  // one PWM count per channel, about 15 deg/sec
-    } while (moved);
-}
+// Phase tables shared by soft-home (blocking, setup-time) and applyPreset
+// (async, loop-time). Same order: clearance → elevation → alignment.
+static const uint8_t  PHASE_CLEARANCE[3] = { 5, 4, 3 }; // Gripper, Wrist Roll, Wrist Pitch
+static const uint8_t  PHASE_ELEVATION[2] = { 2, 1 };    // Elbow, Shoulder
+static const uint8_t  PHASE_ALIGNMENT[1] = { 0 };       // Base
+static const uint8_t  PHASE_SIZES[3]     = { 3, 2, 1 };
+static const uint8_t* PHASE_JOINTS[3]    = {
+    PHASE_CLEARANCE, PHASE_ELEVATION, PHASE_ALIGNMENT
+};
+static const char*    PHASE_NAMES[3]     = { "Clearance", "Elevation", "Alignment" };
 
 void moveToSafePosition() {
-    static const uint16_t startPwmByChannel[6] = {300, 400, 300, 300, 300, 300};
-    static const uint16_t safePwmByChannel[6]  = {400, 300, 300, 300, 300, 300};
-    static const uint8_t clearanceChannels[] = {2, 3, 4};
-    static const uint8_t elevationChannels[] = {0, 1};
-    static const uint8_t alignmentChannels[] = {5};
-    uint16_t current[6];
-
-    for (uint8_t channel = 0; channel < 6; ++channel) {
-        current[channel] = startPwmByChannel[channel];
+    // Stage commands one joint at a time, in clearance → elevation →
+    // alignment order. Each joint gets one pulse to home; SOFT_HOME_SETTLE_MS
+    // separates them so the servos don't all slew at once (power-supply
+    // spike) and so the user sees a deliberate boot sequence. The servos
+    // themselves slew at their own max rate from wherever they actually are.
+    for (uint8_t p = 0; p < 3; p++) {
+        Serial.printf("[HOME] Soft-home: %s\n", PHASE_NAMES[p]);
+        for (uint8_t k = 0; k < PHASE_SIZES[p]; k++)
+            sendJointToHome(PHASE_JOINTS[p][k]);
     }
-    writePwmCounts(current);
+    Serial.println("[HOME] Soft-home complete");
+}
 
-    rampPwmChannels(current, safePwmByChannel, clearanceChannels, 3);
-    rampPwmChannels(current, safePwmByChannel, elevationChannels, 2);
-    rampPwmChannels(current, safePwmByChannel, alignmentChannels, 1);
-    writePwmCounts(safePwmByChannel);
+// ── Staged preset move (async, runs through the motion engine) ──────────────
+// Drips the preset's target angles into servoTarget one phase at a time,
+// waiting for each phase to settle before starting the next. Lowers
+// motionSpeed to PRESET_SPEED_DEG_S while active; restores on completion.
+// processPresetMove() drives the state machine from loop().
+bool       presetActive   = false;
+static int presetTarget[6];
+static uint8_t presetPhase    = 0;
+static float   presetSavedSpd = 0;
 
-    for (uint8_t i = 0; i < 6; ++i) {
-        const Joint& joint = joints[i];
-        int angle = pwmCountToLogicalAngle(safePwmByChannel[joint.ch],
-                                            joint.lo, joint.hi, joint.invert);
-        joints[i].cur = angle;
-        servoCur[i] = (float)angle;
-        servoTarget[i] = (float)angle;
+static void presetStartPhase(uint8_t phase) {
+    Serial.printf("[PRESET] Phase %u: %s\n", (unsigned)phase + 1, PHASE_NAMES[phase]);
+    for (uint8_t k = 0; k < PHASE_SIZES[phase]; k++) {
+        uint8_t j = PHASE_JOINTS[phase][k];
+        setServo(j, presetTarget[j]);   // motion engine ramps at PRESET_SPEED_DEG_S
     }
 }
 
 void applyPreset(const int p[6]) {
-    for (int i = 0; i < 6; i++) setServo(i, p[i]);   // smooth
+    for (int i = 0; i < 6; i++) presetTarget[i] = p[i];
+    if (!presetActive) presetSavedSpd = motionSpeed;
+    motionSpeed   = PRESET_SPEED_DEG_S;
+    presetPhase   = 0;
+    presetActive  = true;
+    presetStartPhase(0);
+    pendingBroadcast = true;
+}
+
+void processPresetMove() {
+    if (!presetActive) return;
+
+    // Settling check: every joint in the phase just dispatched must be within
+    // PRESET_SETTLE_DEG of its target before we advance.
+    uint8_t phaseIdx = (presetPhase >= 3) ? 2 : presetPhase;
+    bool settled = true;
+    for (uint8_t k = 0; k < PHASE_SIZES[phaseIdx]; k++) {
+        uint8_t j = PHASE_JOINTS[phaseIdx][k];
+        if (fabsf(servoTarget[j] - servoCur[j]) > PRESET_SETTLE_DEG) {
+            settled = false; break;
+        }
+    }
+    if (!settled) return;
+
+    presetPhase++;
+    if (presetPhase >= 3) {
+        presetActive  = false;
+        motionSpeed   = presetSavedSpd;
+        Serial.println("[PRESET] Complete");
+        pendingBroadcast = true;
+        return;
+    }
+    presetStartPhase(presetPhase);
 }
 
 // ── Motion engine — ramp servoCur toward servoTarget at motionSpeed ─────────

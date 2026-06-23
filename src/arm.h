@@ -30,8 +30,10 @@ void     setServoNow(uint8_t i, int angle);   // immediate I2C write (startup, R
 void     sendPWM    (uint8_t i, int angle);   // raw fast path (no mutex — caller owns bus)
 void     moveToHome();
 void     moveToSafePosition();
-void     applyPreset(const int p[6]);
+void     applyPreset(const int p[6]);         // staged + slow; uses motion engine
 void     processMotion();                     // advances servoCur -> servoTarget every tick
+void     processPresetMove();                 // drives the async preset state machine
+extern bool presetActive;                     // true while a staged preset is in flight
 
 // ── Teachable presets
 void setPresetFromCurrent(uint8_t idx);       // 0=home 1=ready 2=pick 3=place

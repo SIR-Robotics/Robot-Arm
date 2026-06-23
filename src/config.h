@@ -35,6 +35,11 @@
 #define MAX_POSES    50
 #define PLAY_STEP_MS 1200
 
+// ── Staged motion (soft-home + preset moves)
+#define SOFT_HOME_SETTLE_MS  1000   // pause between joints in setup() boot sequence
+#define PRESET_SPEED_DEG_S   40.0f  // motionSpeed override while a preset is staging
+#define PRESET_SETTLE_DEG    0.5f   // |target-cur| threshold for "phase done"
+
 // ── Types
 struct Joint {
     const char* name;

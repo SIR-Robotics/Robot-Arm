@@ -100,6 +100,7 @@ void loop() {
     processWebJog();
     processButtons();
     processPlayback();
+    processPresetMove();      // advances staged preset moves between phases
     processMotion();          // ramps servoCur -> servoTarget at motionSpeed
     processSerial();
 

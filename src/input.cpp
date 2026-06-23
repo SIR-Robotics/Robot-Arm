@@ -38,6 +38,7 @@ void calibrateJoystick() {
 }
 
 void processJoystick() {
+    if (presetActive) { joyActive = false; return; }
     if (millis() - joyLastMs < JOY_INTERVAL) return;
     joyLastMs = millis();
 
@@ -82,7 +83,7 @@ void processButtons() {
 // webJog[j] is -100..100 from sticks/keyboard/gamepad. Per tick we push the
 // target float by (webJog/100)*WEB_JOG_SPEED. Motion engine catches up.
 void processWebJog() {
-    if (isPlaying || isCycling) { webJogActive = false; return; }
+    if (isPlaying || isCycling || presetActive) { webJogActive = false; return; }
     if (millis() - lastWebJogMs < WEB_JOG_INTERVAL) return;
     lastWebJogMs = millis();
 
