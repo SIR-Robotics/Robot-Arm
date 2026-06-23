@@ -18,7 +18,7 @@ Joint joints[6] = {
 // ── Smooth motion state
 float servoCur[6]    = {129, 62, 86, 86, 86, 0};
 float servoTarget[6] = {129, 62, 86, 86, 86, 0};
-float motionSpeed    = 120.0f;        // deg/sec — ~0.75s for a 90° move
+float motionSpeed    = 40.0f;         // deg/sec — ~2.25s for a 90° move (matches preset speed)
 
 // ── Recording state
 Pose     seq[MAX_POSES];
@@ -28,10 +28,18 @@ bool     isCycling  = false;
 int      playIdx    = 0;
 uint32_t playNextMs = 0;
 
-int POSE_HOME [6] = { 129, 62, 86, 86, 86, 0 };
-int POSE_READY[6] = { 90, 60, 90, 90, 90, 45 };
-int POSE_PICK [6] = { 90, 45, 45, 90, 90,  0 };
-int POSE_PLACE[6] = { 90, 45, 45, 90, 90, 90 };
+Preset presets[MAX_PRESETS] = {
+    { "Home",  1, { { { 129, 62, 86, 86, 86,  0 }, "" } } },
+    { "Ready", 1, { { {  90, 60, 90, 90, 90, 45 }, "" } } },
+    { "Pick",  1, { { {  90, 45, 45, 90, 90,  0 }, "" } } },
+    { "Place", 1, { { {  90, 45, 45, 90, 90, 90 }, "" } } },
+};
+
+// Backward-compat aliases — Stage B refactors callers to use presets[].
+int* POSE_HOME  = presets[0].seq[0].a;
+int* POSE_READY = presets[1].seq[0].a;
+int* POSE_PICK  = presets[2].seq[0].a;
+int* POSE_PLACE = presets[3].seq[0].a;
 
 // ── Servo math ──────────────────────────────────────────────────────────────
 uint16_t toCounts(const Joint& j, int angle) {
@@ -295,20 +303,52 @@ void setPresetFromCurrent(uint8_t idx) {
 
 void savePresetsToFlash() {
     prefs.begin("roboarm", false);
-    prefs.putBytes("ph", POSE_HOME,  sizeof(POSE_HOME));
-    prefs.putBytes("pr", POSE_READY, sizeof(POSE_READY));
-    prefs.putBytes("pk", POSE_PICK,  sizeof(POSE_PICK));
-    prefs.putBytes("pl", POSE_PLACE, sizeof(POSE_PLACE));
+    for (uint8_t i = 0; i < MAX_PRESETS; i++) {
+        char key[4]; snprintf(key, sizeof(key), "ps%u", (unsigned)i);
+        prefs.putBytes(key, &presets[i], sizeof(Preset));
+    }
     prefs.end();
+    Serial.printf("[FLASH] Presets saved (%u slots)\n", (unsigned)MAX_PRESETS);
 }
 
 void loadPresetsFromFlash() {
-    prefs.begin("roboarm", true);
-    if (prefs.isKey("ph")) prefs.getBytes("ph", POSE_HOME,  sizeof(POSE_HOME));
-    if (prefs.isKey("pr")) prefs.getBytes("pr", POSE_READY, sizeof(POSE_READY));
-    if (prefs.isKey("pk")) prefs.getBytes("pk", POSE_PICK,  sizeof(POSE_PICK));
-    if (prefs.isKey("pl")) prefs.getBytes("pl", POSE_PLACE, sizeof(POSE_PLACE));
+    // Migration: convert old per-pose keys (ph/pr/pk/pl) into the new preset
+    // format on first boot after the upgrade. Old keys are removed afterwards
+    // so this only fires once.
+    prefs.begin("roboarm", false);
+    bool migrated = false;
+    if (prefs.isKey("ph") && !prefs.isKey("ps0")) {
+        int oldHome[6], oldReady[6], oldPick[6], oldPlace[6];
+        prefs.getBytes("ph", oldHome,  sizeof(oldHome));
+        prefs.getBytes("pr", oldReady, sizeof(oldReady));
+        prefs.getBytes("pk", oldPick,  sizeof(oldPick));
+        prefs.getBytes("pl", oldPlace, sizeof(oldPlace));
+        for (int j = 0; j < 6; j++) {
+            presets[0].seq[0].a[j] = oldHome[j];
+            presets[1].seq[0].a[j] = oldReady[j];
+            presets[2].seq[0].a[j] = oldPick[j];
+            presets[3].seq[0].a[j] = oldPlace[j];
+        }
+        for (uint8_t i = 0; i < MAX_PRESETS; i++) presets[i].len = 1;
+        for (uint8_t i = 0; i < MAX_PRESETS; i++) {
+            char key[4]; snprintf(key, sizeof(key), "ps%u", (unsigned)i);
+            prefs.putBytes(key, &presets[i], sizeof(Preset));
+        }
+        prefs.remove("ph"); prefs.remove("pr");
+        prefs.remove("pk"); prefs.remove("pl");
+        migrated = true;
+    }
     prefs.end();
+
+    prefs.begin("roboarm", true);
+    for (uint8_t i = 0; i < MAX_PRESETS; i++) {
+        char key[4]; snprintf(key, sizeof(key), "ps%u", (unsigned)i);
+        if (prefs.isKey(key)) prefs.getBytes(key, &presets[i], sizeof(Preset));
+    }
+    prefs.end();
+
+    Serial.printf("[FLASH] Presets loaded%s\n",
+                  migrated ? " (migrated from old format)" : "");
 }
 
 // ── Playback ────────────────────────────────────────────────────────────────

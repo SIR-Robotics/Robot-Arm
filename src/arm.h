@@ -17,11 +17,16 @@ extern bool   isCycling;
 extern int    playIdx;
 extern uint32_t playNextMs;
 
-// Mutable so user can re-teach them from the current arm position.
-extern int POSE_HOME [6];
-extern int POSE_READY[6];
-extern int POSE_PICK [6];
-extern int POSE_PLACE[6];
+// Sequence-capable preset slots. Each can hold up to MAX_POSES_PER_PRESET poses.
+extern Preset presets[MAX_PRESETS];
+
+// Stage-A compat aliases — point at preset[i].seq[0].a so existing code
+// (applyPreset, setPresetFromCurrent, the PR tag, the serial HOME/READY/PICK/
+// PLACE commands) keeps working unchanged. Stage B will refactor callers.
+extern int* POSE_HOME;
+extern int* POSE_READY;
+extern int* POSE_PICK;
+extern int* POSE_PLACE;
 
 // ── Servo
 uint16_t toCounts(const Joint& j, int angle);

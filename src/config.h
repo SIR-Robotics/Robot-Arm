@@ -23,17 +23,17 @@
 #define BTN_CYCLE_PIN 27
 
 #define JOY_DEADZONE 300
-#define JOY_SPEED    1.2f
+#define JOY_SPEED    0.8f       // 0.8°/20ms = 40°/s, matches motionSpeed cap
 #define JOY_INTERVAL 20
 #define DEBOUNCE_MS  220
 
 // ── Web jog smoothing
 #define WEB_JOG_INTERVAL 25
-#define WEB_JOG_SPEED    2.0f
+#define WEB_JOG_SPEED    1.0f   // 1.0°/25ms = 40°/s, matches motionSpeed cap
 
 // ── Recording
 #define MAX_POSES    50
-#define PLAY_STEP_MS 1200
+#define PLAY_STEP_MS 3000       // 3s/pose, enough for 120° move at 40°/s
 
 // ── Staged motion (soft-home + preset moves)
 #define SOFT_HOME_SETTLE_MS  1000   // pause between joints in setup() boot sequence
@@ -53,5 +53,14 @@ struct Joint {
 };
 
 struct Pose { int a[6]; char label[20]; };
+
+#define MAX_PRESETS          4
+#define MAX_POSES_PER_PRESET 30
+
+struct Preset {
+    char name[20];
+    int  len;
+    Pose seq[MAX_POSES_PER_PRESET];
+};
 
 struct WsMsg { char buf[96]; };
