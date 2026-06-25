@@ -62,9 +62,18 @@ void playPreset(uint8_t idx);                 // 1-pose → staged move; multi-p
 // Position = wrist roll motor center (NOT gripper tip — tool offset is applied
 // separately by callers that need the tip, e.g. pick-and-place targeting).
 struct Pose3D {
-    float x, y, z;     // mm — origin = base servo axis, Z up, +X = "forward"
+    float x, y, z;     // mm — origin = shoulder pivot, Z up, +Y = forward, +X = right
     float rx, ry, rz;  // deg — RPY: roll about tool, pitch from vertical, yaw about Z
 };
 
 Pose3D computeFK();    // reads servoCur[]
-void   printFK();      // emits the spec'd serial line
+void   printFK();      // emits the spec'd serial line (only when value changed)
+
+// IK: solve joints for an operator-frame target. Returns false if unreachable
+// or if any joint would exceed its [lo, hi]. out_logical[0..4] = base, shoulder,
+// elbow, wrist pitch, wrist roll (logical degrees, ready for setServo).
+//   fixed_ry=true  → constrain tool pitch to ry_deg (uses up the 4th DOF)
+//   fixed_ry=false → wrist pitch held neutral (t4=0); ry_deg is ignored;
+//                    reach is wider because L4 collapses into a 2-link arm.
+bool solveIK(float x, float y, float z, float ry_deg, bool fixed_ry, int out_logical[5]);
+void moveToXYZ(float x, float y, float z, float ry_deg, bool fixed_ry);  // solve + smooth move

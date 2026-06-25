@@ -7,20 +7,24 @@
 #include <WiFi.h>
 
 // ── No-heap JSON buffers
-static char statusBuf[220];
+static char statusBuf[300];
 static char posesBuf[3000];
 
 // ── JSON builders ───────────────────────────────────────────────────────────
 const char* buildStatus() {
+    Pose3D fk = computeFK();
     snprintf(statusBuf, sizeof(statusBuf),
         "{\"t\":\"s\",\"j\":[%d,%d,%d,%d,%d,%d],"
-        "\"m\":%u,\"l\":%d,\"p\":%d,\"c\":%d,\"i\":%d,\"r\":%d,\"b\":%u}",
+        "\"m\":%u,\"l\":%d,\"p\":%d,\"c\":%d,\"i\":%d,\"r\":%d,\"b\":%u,"
+        "\"x\":%ld,\"y\":%ld,\"z\":%ld,\"rx\":%ld,\"ry\":%ld,\"rz\":%ld}",
         joints[0].cur, joints[1].cur, joints[2].cur,
         joints[3].cur, joints[4].cur, joints[5].cur,
         (unsigned)joyMode, seqLen,
         isPlaying ? 1 : 0, isCycling ? 1 : 0, playIdx,
         (int)WiFi.RSSI(),
-        (unsigned)bootState);
+        (unsigned)bootState,
+        lroundf(fk.x),  lroundf(fk.y),  lroundf(fk.z),
+        lroundf(fk.rx), lroundf(fk.ry), lroundf(fk.rz));
     return statusBuf;
 }
 
@@ -186,6 +190,16 @@ void processWsCmd(char* msg) {
         case TAG('C','L'): clearRecording(); broadcastPoses(); break;
         case TAG('S','A'): saveToFlash(); break;
         case TAG('L','D'): loadFromFlash(); broadcastPoses(); break;
+        case TAG('M','V'): {                             // MV:x:y:z[:ry]  IK move
+            if (!args[0] || !args[1] || !args[2]) break;
+            float x = atof(args[0]);
+            float y = atof(args[1]);
+            float z = atof(args[2]);
+            bool fixed = (args[3] != nullptr);
+            float ry = fixed ? atof(args[3]) : 0.0f;
+            moveToXYZ(x, y, z, ry, fixed);
+            break;
+        }
     }
 }
 
@@ -311,6 +325,9 @@ static void printHelp() {
     Serial.println(F("  PRESET <0-3>        same as the digit shortcut"));
     Serial.println(F("  RENAME <0-3> <nm>   rename a preset (UPPERCASE)"));
     Serial.println(F("  S <j> <a>           set joint j to angle a (smooth)"));
+    Serial.println(F("  MOVE                show current XYZ + Rxyz"));
+    Serial.println(F("  MOVE x y z          IK move (free Ry — wider reach)"));
+    Serial.println(F("  MOVE x y z ry       IK move with tool pitch pinned"));
     Serial.println(F("  INVERT <j>          toggle joint direction"));
     Serial.println(F("  SPEED [deg/sec]     get/set motion engine speed"));
     Serial.println(F("  TEST                lo→home→hi sweep per joint"));
@@ -494,6 +511,30 @@ void processSerial() {
             delay(1500);
         }
         Serial.println("[SWEEP] Done");
+    }
+    else if (cmd == "MOVE") {
+        // No args — one-shot current FK readout (force-prints even if
+        // printFK's change-detector is sitting on the same values).
+        Pose3D p = computeFK();
+        Serial.printf("X: %ld mm, Y: %ld mm, Z: %ld mm | Rx: %ld, Ry: %ld, Rz: %ld\n",
+            lroundf(p.x),  lroundf(p.y),  lroundf(p.z),
+            lroundf(p.rx), lroundf(p.ry), lroundf(p.rz));
+    }
+    else if (cmd.startsWith("MOVE ")) {
+        // 3 args → free-Ry (wider reach); 4 args → fixed-Ry (tool orientation pinned)
+        float v[4] = {0, 0, 0, 0};
+        int n = 0, p = 5;
+        while (n < 4) {
+            int q = cmd.indexOf(' ', p);
+            v[n++] = (q < 0 ? cmd.substring(p) : cmd.substring(p, q)).toFloat();
+            if (q < 0) break;
+            p = q + 1;
+        }
+        if (n < 3) {
+            Serial.println("Usage: MOVE <x> <y> <z> [ry]   (4th arg = pin tool pitch)");
+        } else {
+            moveToXYZ(v[0], v[1], v[2], v[3], /*fixed_ry=*/ n >= 4);
+        }
     }
     else if (cmd == "HELP") printHelp();
     // ── Long-form aliases for the legacy verbs (REC/PLAY/STOP/...) ─────────

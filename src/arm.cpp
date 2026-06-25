@@ -4,9 +4,12 @@
 #include <math.h>
 
 // ── Link geometry (mm) — measured from the physical arm.
-// L4 ends at the wrist roll motor center; the gripper beyond that is a tool
-// offset added later by pick-and-place code, not part of FK.
-constexpr float L1 = 43.0f;   // base axis → shoulder pivot
+// FK origin = shoulder pivot (NOT base servo plate). The 43 mm base column
+// is intentionally excluded so Z=0 sits at shoulder height — at full
+// horizontal reach the wrist roll center reads Z=0, which is the natural
+// reference plane for IK. L4 ends at the wrist roll motor center; the
+// 111 mm gripper extension beyond it is a tool offset, applied later by
+// pick-and-place code, not part of FK.
 constexpr float L2 = 83.0f;   // upper arm: shoulder → elbow
 constexpr float L3 = 77.0f;   // forearm:   elbow → wrist pitch axis
 constexpr float L4 = 68.0f;   // wrist:     wrist pitch axis → wrist roll center
@@ -14,11 +17,19 @@ constexpr float L4 = 68.0f;   // wrist:     wrist pitch axis → wrist roll cent
 // ── Joint zero offsets (logical degrees that correspond to FK "zero").
 // Reference pose (all zeros) = arm pointing straight up along +Z, base
 // forward along +X, wrist roll centered. Calibrated in a later phase.
-constexpr float Z_BASE     = 135.0f;
-constexpr float Z_SHOULDER =  90.0f;
-constexpr float Z_ELBOW    =  90.0f;
+constexpr float Z_BASE     = 121.0f;
+constexpr float Z_SHOULDER =  65.0f;
+constexpr float Z_ELBOW    =  81.0f;
 constexpr float Z_W_PITCH  =  90.0f;
 constexpr float Z_W_ROLL   =  90.0f;
+
+// ── Workspace bias — shifts FK output so the operator's preferred reference
+// pose reads as (X=0, Y=Y_max, Z=0, Ry=0). Decouples kinematic frame from
+// operator frame; tune by snapshotting current FK output at the desired
+// reference pose. Applied as a post-FK subtraction, so kinematic math
+// (sin/cos chain) stays geometrically correct.
+constexpr float Z_OUT_OFFSET  = 150.0f;   // mm — subtracted from FK z
+constexpr float RY_OUT_OFFSET =  49.0f;   // deg — subtracted from FK ry
 
 // ── Joint table ─────────────────────────────────────────────────────────────
 // minUs/maxUs are physical pulse-width calibration; counts derived per-tick.
@@ -301,23 +312,118 @@ Pose3D computeFK() {
     float a23  = t2 + t3;
     float a234 = a23 + t4;
     float r = L2*sinf(t2) + L3*sinf(a23) + L4*sinf(a234);
-    float z = L1 + L2*cosf(t2) + L3*cosf(a23) + L4*cosf(a234);
+    float z = L2*cosf(t2) + L3*cosf(a23) + L4*cosf(a234);
 
     Pose3D p;
-    p.x  = r * cosf(t1);
-    p.y  = r * sinf(t1);
-    p.z  = z;
-    p.rx = t5   / D2R;   // tool roll
-    p.ry = a234 / D2R;   // tool pitch from vertical (0=up, 90=horizontal)
-    p.rz = t1   / D2R;   // base yaw from +X
+    p.x  = r * sinf(t1);              // +X = right (base CW from above)
+    p.y  = r * cosf(t1);              // +Y = forward (base θ1=0 → arm along +Y)
+    p.z  = z  - Z_OUT_OFFSET;         // shifted: operator reference plane → Z=0
+    p.rx = t5 / D2R;                  // tool roll
+    p.ry = (a234 / D2R) - RY_OUT_OFFSET;  // shifted: operator reference → Ry=0
+    p.rz = t1 / D2R;                  // base yaw from +X
     return p;
 }
 
 void printFK() {
     Pose3D p = computeFK();
+    long x  = lroundf(p.x),  y  = lroundf(p.y),  z  = lroundf(p.z);
+    long rx = lroundf(p.rx), ry = lroundf(p.ry), rz = lroundf(p.rz);
+
+    static bool first = true;
+    static long pX, pY, pZ, pRx, pRy, pRz;
+    if (!first && x==pX && y==pY && z==pZ && rx==pRx && ry==pRy && rz==pRz) return;
+    first = false;
+    pX=x; pY=y; pZ=z; pRx=rx; pRy=ry; pRz=rz;
+
     Serial.printf("X: %ld mm, Y: %ld mm, Z: %ld mm | Rx: %ld, Ry: %ld, Rz: %ld\n",
-        lroundf(p.x),  lroundf(p.y),  lroundf(p.z),
-        lroundf(p.rx), lroundf(p.ry), lroundf(p.rz));
+        x, y, z, rx, ry, rz);
+}
+
+// ── Inverse kinematics (operator frame) ─────────────────────────────────────
+// Inverts computeFK(): given a wrist-roll-center target (x, y, z) and tool
+// pitch ry (all in operator coords, i.e. after the OUT_OFFSET biases), solve
+// for joint angles. Strategy: peel off base yaw + L4 to get a 2D wrist-pitch
+// target (r2, z2), then standard 2-link IK on L2/L3, then back out wrist
+// pitch from the orientation constraint. Elbow-up only — second solution
+// (elbow-down) omitted intentionally for predictability.
+bool solveIK(float x, float y, float z, float ry_deg, bool fixed_ry, int out_logical[5]) {
+    const float D2R = (float)M_PI / 180.0f;
+
+    // Operator → internal frame (undo the workspace biases)
+    float zi = z + Z_OUT_OFFSET;
+
+    // Base yaw + radial; +X right, +Y forward → t1 = atan2(x, y)
+    float t1 = atan2f(x, y);
+    float r  = sqrtf(x*x + y*y);
+
+    float t2, t3, t4;
+
+    if (fixed_ry) {
+        // 4-DOF: tool orientation locked to ry_deg. Step back L4 along the
+        // tool axis to find the wrist-pitch joint position, then 2-link IK
+        // on L2/L3 reaches that.
+        float ryi_rad = (ry_deg + RY_OUT_OFFSET) * D2R;
+        float r2 = r  - L4 * sinf(ryi_rad);
+        float z2 = zi - L4 * cosf(ryi_rad);
+        float d2    = r2*r2 + z2*z2;
+        float cosT3 = (d2 - L2*L2 - L3*L3) / (2.0f * L2 * L3);
+        if (cosT3 < -1.0f || cosT3 > 1.0f) return false;
+        t3 = acosf(cosT3);                              // elbow-up
+        float A = L2 + L3 * cosf(t3);
+        float B = L3 * sinf(t3);
+        t2 = atan2f(A*r2 - B*z2, B*r2 + A*z2);
+        t4 = ryi_rad - t2 - t3;
+    } else {
+        // 3-DOF: wrist pitch pinned neutral (t4=0), so L4 collapses inline
+        // with the forearm. Effective 2-link arm: L2 + (L3+L4). The free
+        // DOF goes into reach instead of orientation — tool ends up wherever
+        // the forearm points (Ry = t2 + t3).
+        float Le    = L3 + L4;
+        float d2    = r*r + zi*zi;
+        float cosT3 = (d2 - L2*L2 - Le*Le) / (2.0f * L2 * Le);
+        if (cosT3 < -1.0f || cosT3 > 1.0f) return false;
+        t3 = acosf(cosT3);                              // elbow-up
+        float A = L2 + Le * cosf(t3);
+        float B = Le * sinf(t3);
+        t2 = atan2f(A*r - B*zi, B*r + A*zi);
+        t4 = 0.0f;
+    }
+
+    out_logical[0] = (int)lroundf(t1 / D2R + Z_BASE);
+    out_logical[1] = (int)lroundf(t2 / D2R + Z_SHOULDER);
+    out_logical[2] = (int)lroundf(t3 / D2R + Z_ELBOW);
+    out_logical[3] = (int)lroundf(t4 / D2R + Z_W_PITCH);
+    out_logical[4] = (int)lroundf(Z_W_ROLL);            // hold wrist roll neutral
+
+    for (int i = 0; i < 5; i++) {
+        if (out_logical[i] < joints[i].lo || out_logical[i] > joints[i].hi) {
+            return false;                               // joint stop blocks it
+        }
+    }
+    return true;
+}
+
+void moveToXYZ(float x, float y, float z, float ry_deg, bool fixed_ry) {
+    int s[5];
+    if (!solveIK(x, y, z, ry_deg, fixed_ry, s)) {
+        if (fixed_ry) {
+            Serial.printf("[IK] unreachable: (%.0f, %.0f, %.0f, Ry=%.0f)\n",
+                          x, y, z, ry_deg);
+        } else {
+            Serial.printf("[IK] unreachable: (%.0f, %.0f, %.0f) free-Ry\n",
+                          x, y, z);
+        }
+        return;
+    }
+    if (fixed_ry) {
+        Serial.printf("[IK] (%.0f, %.0f, %.0f, Ry=%.0f) -> base=%d sh=%d el=%d wp=%d wr=%d\n",
+                      x, y, z, ry_deg, s[0], s[1], s[2], s[3], s[4]);
+    } else {
+        Serial.printf("[IK] (%.0f, %.0f, %.0f) free-Ry -> base=%d sh=%d el=%d wp=%d wr=%d\n",
+                      x, y, z, s[0], s[1], s[2], s[3], s[4]);
+    }
+    for (int i = 0; i < 5; i++) setServo(i, s[i]);
+    pendingBroadcast = true;
 }
 
 // ── Recording ───────────────────────────────────────────────────────────────

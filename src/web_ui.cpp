@@ -81,6 +81,18 @@ button.amb.on{background:linear-gradient(180deg,#e6a817,#c08810);color:#111;bord
  <div class=tw><div class=ttl>WRIST ROLL</div><div class=trk id=tR data-j=4><div class=tnb></div></div><div class=kbd><kbd>Q</kbd><kbd>E</kbd></div></div>
  <div class=tw><div class=ttl>GRIPPER</div><div class=trk id=tG data-j=5><div class=tnb></div></div><div class=kbd><kbd>Z</kbd><kbd>X</kbd></div></div>
 </div>
+<div class=p><h2>FK Position</h2><div id=fk style="font-family:Consolas,monospace;font-size:.82rem;color:var(--ac3);text-align:center;letter-spacing:.4px">--</div></div>
+<div class=p><h2>Fine Jog</h2><div id=fjp></div></div>
+<div class=p><h2>IK Move</h2>
+ <div style="display:grid;grid-template-columns:repeat(4,1fr) 70px;gap:6px;align-items:center;margin-bottom:7px">
+  <input id=mvx type=number placeholder=X step=1 class=ri style="width:auto">
+  <input id=mvy type=number placeholder=Y step=1 class=ri style="width:auto">
+  <input id=mvz type=number placeholder=Z step=1 class=ri style="width:auto">
+  <input id=mvr type=number placeholder=Ry step=1 class=ri style="width:auto">
+  <button class=grn onclick=mv()>GO</button>
+ </div>
+ <div class=kbd>Ry empty = free wrist pitch (wider reach)</div>
+</div>
 <div class=p><h2>Presets</h2><div class=g4 id=psg></div><div class=kbd style=margin-top:7px>Tap card to run &mdash; tap name to rename &mdash; long-press to save current pose</div></div>
 <div class=p><h2>Recording <span class=bd id=rc>0</span></h2>
  <div class=g4 style=margin-bottom:7px>
@@ -164,6 +176,11 @@ function aS(d){
  const cb=document.getElementById('bc');cb.classList.toggle('on',!!d.c);
  cb.innerHTML=d.c?'■ CYCLE LOOP &mdash; ON':'&#9654;&#9654; CYCLE LOOP &mdash; OFF';
  if(typeof d.r==='number')document.getElementById('rs').textContent=d.r+' dBm';
+ if(typeof d.x==='number'){
+  document.getElementById('fk').textContent=`X: ${d.x} mm   Y: ${d.y} mm   Z: ${d.z} mm   |   Rx: ${d.rx}°   Ry: ${d.ry}°   Rz: ${d.rz}°`;
+ }
+ // Refresh fine-jog angle readouts alongside the joint chips
+ d.j.forEach((a,i)=>{const fv=document.getElementById('fv'+i);if(fv)fv.textContent=a+'°'});
  if(typeof d.b==='number'){
   const FSM=['INIT','HOMING','IDLE','BUSY','FAULT'];
   const COL=['#666','#3a78c9','#27ae60','#e6a817','#e94560'];
@@ -416,6 +433,32 @@ document.getElementById('iF').onchange=e=>{
  };
  r.readAsText(f);e.target.value='';
 };
+
+// ── Fine jog (per-joint ±1° / ±5° nudge buttons) ─────────────────────────
+const fjpEl=document.getElementById('fjp');
+JD.forEach((j,i)=>{
+ fjpEl.insertAdjacentHTML('beforeend',`<div style="display:grid;grid-template-columns:70px 60px repeat(4,1fr);gap:4px;align-items:center;margin-bottom:4px">
+  <span style="font-size:.7rem;color:#789;letter-spacing:1px">${j.k}</span>
+  <span id=fv${i} style="text-align:right;font-family:Consolas,monospace;color:var(--ac);font-weight:800;font-size:.85rem">--</span>
+  <button onclick="nj(${i},-5)" style="padding:6px 0">-5</button>
+  <button onclick="nj(${i},-1)" style="padding:6px 0">-1</button>
+  <button onclick="nj(${i},1)"  style="padding:6px 0">+1</button>
+  <button onclick="nj(${i},5)"  style="padding:6px 0">+5</button>
+ </div>`);
+});
+// Optimistic local update so rapid clicks accumulate before the server's
+// next status broadcast (server will reconcile on its broadcast tick).
+function nj(i,d){lastA[i]+=d;const a=lastA[i];w('SV:'+i+':'+a);document.getElementById('v'+i).textContent=a+'°';const fv=document.getElementById('fv'+i);if(fv)fv.textContent=a+'°';tt(JD[i].k+' '+(d>0?'+':'')+d+' → '+a+'°')}
+
+// ── IK MOVE submit ───────────────────────────────────────────────────────
+function mv(){
+ const x=+document.getElementById('mvx').value||0;
+ const y=+document.getElementById('mvy').value||0;
+ const z=+document.getElementById('mvz').value||0;
+ const rv=document.getElementById('mvr').value.trim();
+ if(rv){w('MV:'+x+':'+y+':'+z+':'+rv);tt('IK '+x+','+y+','+z+' Ry='+rv)}
+ else{w('MV:'+x+':'+y+':'+z);tt('IK '+x+','+y+','+z+' free Ry')}
+}
 
 cn();
 </script></body></html>)raw";
