@@ -16,7 +16,8 @@ const char* buildStatus() {
     snprintf(statusBuf, sizeof(statusBuf),
         "{\"t\":\"s\",\"j\":[%d,%d,%d,%d,%d,%d],"
         "\"m\":%u,\"l\":%d,\"p\":%d,\"c\":%d,\"i\":%d,\"r\":%d,\"b\":%u,"
-        "\"x\":%ld,\"y\":%ld,\"z\":%ld,\"rx\":%ld,\"ry\":%ld,\"rz\":%ld}",
+        "\"x\":%ld,\"y\":%ld,\"z\":%ld,\"rx\":%ld,\"ry\":%ld,\"rz\":%ld,"
+        "\"ik\":%d}",
         joints[0].cur, joints[1].cur, joints[2].cur,
         joints[3].cur, joints[4].cur, joints[5].cur,
         (unsigned)joyMode, seqLen,
@@ -24,7 +25,8 @@ const char* buildStatus() {
         (int)WiFi.RSSI(),
         (unsigned)bootState,
         lroundf(fk.x),  lroundf(fk.y),  lroundf(fk.z),
-        lroundf(fk.rx), lroundf(fk.ry), lroundf(fk.rz));
+        lroundf(fk.rx), lroundf(fk.ry), lroundf(fk.rz),
+        ikControlMode ? 1 : 0);
     return statusBuf;
 }
 
@@ -85,17 +87,19 @@ void broadcastPresets() {
 //   GT:p               goto pose (smooth ramp; no playback)
 //   PY / ST / CY       play / stop / toggle cycle of live sequence
 //   CL / SA / LD       clear / save / load live sequence
+//   ID:dx:dy:dz:dry:drx IK delta jog (-100..100 per axis)
+//   IK:[0|1]            toggle IK control mode (0=joint, 1=IK)
 #define TAG(a,b) ((uint16_t)(((a)<<8) | (b)))
 
 void processWsCmd(char* msg) {
     if (msg[0] == 0 || msg[1] == 0) return;
     uint16_t tag = TAG((uint8_t)msg[0], (uint8_t)msg[1]);
 
-    char* args[4] = { nullptr, nullptr, nullptr, nullptr };
+    char* args[5] = { nullptr, nullptr, nullptr, nullptr, nullptr };
     if (msg[2] == ':') {
         char* s = msg + 3;
         args[0] = s;
-        for (int i = 1; i < 4 && (s = strchr(s, ':')) != nullptr; i++) {
+        for (int i = 1; i < 5 && (s = strchr(s, ':')) != nullptr; i++) {
             *s++ = '\0';
             args[i] = s;
         }
@@ -200,6 +204,24 @@ void processWsCmd(char* msg) {
             moveToXYZ(x, y, z, ry, fixed);
             break;
         }
+        case TAG('I','D'): {                             // ID:dx:dy:dz:dry:drx  IK delta jog
+            for (int i = 0; i < 5; i++) {
+                ikWebJog[i] = (args[i] != nullptr) ? constrain(atoi(args[i]), -100, 100) : 0;
+            }
+            break;
+        }
+        case TAG('I','K'): {                             // IK:[0|1]  toggle IK control mode
+            if (args[0]) {
+                ikControlMode = (atoi(args[0]) != 0);
+                if (!ikControlMode) {
+                    for (int i = 0; i < 5; i++) ikWebJog[i] = 0;
+                    ikWebJogActive = false;
+                }
+                Serial.printf("[IK] Control mode: %s\n", ikControlMode ? "IK (XYZ)" : "Joint");
+                pendingBroadcast = true;
+            }
+            break;
+        }
     }
 }
 
@@ -297,6 +319,7 @@ void onWsEvent(AsyncWebSocket*, AsyncWebSocketClient* client,
         if (client->canSend()) client->text(buildPresets());
     } else if (type == WS_EVT_DISCONNECT) {
         for (int j = 0; j < 6; j++) webJog[j] = 0;
+        for (int i = 0; i < 5; i++) ikWebJog[i] = 0;
     } else if (type == WS_EVT_DATA) {
         AwsFrameInfo* info = (AwsFrameInfo*)arg;
         if (info->final && info->index == 0 && info->len == len && info->opcode == WS_TEXT) {
@@ -330,6 +353,7 @@ static void printHelp() {
     Serial.println(F("  MOVE x y z ry       IK move with tool pitch pinned"));
     Serial.println(F("  INVERT <j>          toggle joint direction"));
     Serial.println(F("  SPEED [deg/sec]     get/set motion engine speed"));
+    Serial.println(F("  IKMODE [ON|OFF]     toggle IK control mode (XYZ vs joint jog)"));
     Serial.println(F("  TEST                lo→home→hi sweep per joint"));
     Serial.println(F("─── Calibration ───────────────────────────────────────"));
     Serial.println(F("  RAW <j> <counts>           direct PCA9685 write"));
@@ -391,6 +415,21 @@ void processSerial() {
             setServoNow(i, joints[i].home); delay(600);
         }
         pendingBroadcast = true;
+    }
+    else if (cmd.startsWith("IKMODE")) {
+        if (cmd.length() <= 6) {
+            Serial.printf("[IK] Control mode: %s\n", ikControlMode ? "IK (XYZ)" : "Joint");
+        } else {
+            String val = cmd.substring(7);
+            val.trim(); val.toUpperCase();
+            ikControlMode = (val == "ON" || val == "1");
+            if (!ikControlMode) {
+                for (int i = 0; i < 5; i++) ikWebJog[i] = 0;
+                ikWebJogActive = false;
+            }
+            Serial.printf("[IK] Control mode: %s\n", ikControlMode ? "IK (XYZ)" : "Joint");
+            pendingBroadcast = true;
+        }
     }
     else if (cmd.startsWith("SPEED")) {
         if (cmd.length() <= 5) {

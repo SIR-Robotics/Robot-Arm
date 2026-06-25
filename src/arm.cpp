@@ -403,6 +403,127 @@ bool solveIK(float x, float y, float z, float ry_deg, bool fixed_ry, int out_log
     return true;
 }
 
+// ── 6-DOF Inverse Kinematics (full position + orientation) ──────────────────
+// Solves all 5 arm joints (base/shoulder/elbow/wrist-pitch/wrist-roll) from
+// a target (x,y,z) and tool orientation (rx=roll, ry=pitch, both degrees).
+// rz is NOT an input — the base angle is determined by atan2(x,y).
+//
+// Algorithm (analytical, closed-form):
+//   1. Base yaw t1 = atan2(x, y) — arm is a planar chain rotated about Z.
+//   2. Tool orientation constrains total pitch a234 = t2+t3+t4 = ry.
+//   3. Wrist roll t5 = rx (direct, on tool axis).
+//   4. Step back L4 along the tool axis → wrist-pitch joint center (r2,z2).
+//   5. Standard 2-link IK (cosine rule) on L2-L3 with elbow-up (acos positive).
+//   6. Back-solve t4 from the orientation constraint: t4 = a234 - t2 - t3.
+//   7. Convert kinematic angles → logical servo degrees via zero-offset table.
+//   8. Clamp each joint to [lo, hi]; return false if any hit.
+//
+// Reference: Peter Corke, "Robotics, Vision and Control" §7.3 — planar arm IK.
+bool solveIK6DOF(float x, float y, float z, float rx_deg, float ry_deg,
+                 int out_logical[5]) {
+    const float D2R = (float)M_PI / 180.0f;
+
+    float zi = z + Z_OUT_OFFSET;
+    float t1 = atan2f(x, y);
+    float rad = sqrtf(x*x + y*y);
+
+    float a234 = (ry_deg + RY_OUT_OFFSET) * D2R;
+    float t5   =  rx_deg * D2R;
+
+    float r2 = rad - L4 * sinf(a234);
+    float z2 = zi  - L4 * cosf(a234);
+
+    float d2    = r2*r2 + z2*z2;
+    float cosT3 = (d2 - L2*L2 - L3*L3) / (2.0f * L2 * L3);
+    if (cosT3 < -1.0f || cosT3 > 1.0f) return false;
+
+    float t3_options[2] = { acosf(cosT3), -acosf(cosT3) };
+
+    float bestErr = 1e9f;
+    bool  found   = false;
+    int   bestJ[5];
+
+    for (int bc = 0; bc < 4; bc++) {
+        float tb = t1 + bc * (float)M_PI;
+        int baseL = (int)lroundf(tb / D2R + Z_BASE);
+        if (baseL < joints[0].lo || baseL > joints[0].hi) continue;
+
+        for (int branch = 0; branch < 2; branch++) {
+            float t3 = t3_options[branch];
+            float A  = L2 + L3 * cosf(t3);
+            float B  = L3 * sinf(t3);
+            float t2 = atan2f(A*r2 - B*z2, B*r2 + A*z2);
+            float t4 = a234 - t2 - t3;
+
+            int cand[5];
+            cand[0] = baseL;
+            cand[1] = (int)lroundf(t2 / D2R + Z_SHOULDER);
+            cand[2] = (int)lroundf(t3 / D2R + Z_ELBOW);
+            cand[3] = (int)lroundf(t4 / D2R + Z_W_PITCH);
+            cand[4] = (int)lroundf(t5 / D2R + Z_W_ROLL);
+
+            bool valid = true;
+            for (int i = 1; i < 5; i++) {
+                if (cand[i] < joints[i].lo || cand[i] > joints[i].hi) {
+                    valid = false; break;
+                }
+            }
+            if (!valid) continue;
+
+            // Evaluate FK position error for this candidate
+            float  ca[5] = {(float)cand[0],(float)cand[1],(float)cand[2],
+                             (float)cand[3],(float)cand[4]};
+            float ct1 = (ca[0] - Z_BASE)     * D2R;
+            float ct2 = (ca[1] - Z_SHOULDER) * D2R;
+            float ct3 = (ca[2] - Z_ELBOW)    * D2R;
+            float ct4 = (ca[3] - Z_W_PITCH)  * D2R;
+            float ca23 = ct2 + ct3, ca234 = ca23 + ct4;
+            float cr = L2*sinf(ct2) + L3*sinf(ca23) + L4*sinf(ca234);
+            float cz = L2*cosf(ct2) + L3*cosf(ca23) + L4*cosf(ca234);
+            float cx = cr * sinf(ct1), cy = cr * cosf(ct1);
+            float cxErr = cx - x, cyErr = cy - y, czErr = (cz - Z_OUT_OFFSET) - z;
+            float err = cxErr*cxErr + cyErr*cyErr + czErr*czErr;
+
+            if (err < bestErr) {
+                bestErr = err;
+                for (int i = 0; i < 5; i++) bestJ[i] = cand[i];
+                found = true;
+            }
+        }
+    }
+    if (!found) return false;
+    // Reject solutions with large position error (incremential jog near origin
+    // can produce wrong-quadrant solutions when FK had r<0).
+    if (bestErr > 100.0f) return false;               // >10 mm² error → treat as unreachable
+    for (int i = 0; i < 5; i++) out_logical[i] = bestJ[i];
+    return true;
+}
+
+// IK control mode — toggled via serial/web. When active, joystick and web
+// controls move the end-effector in world coordinates instead of jogging
+// individual joints. Gripper (joint 5) stays in direct mode always.
+bool ikControlMode = false;
+bool ikJogActive   = false;
+
+// Relative IK jog: compute current FK, add world-frame delta, re-solve.
+// Silently ignores unreachable targets so the user can push out and back
+// without hitting an error on every out-of-workspace tick.
+void ikJogDelta(float dx, float dy, float dz, float dry, float drx) {
+    Pose3D cur = computeFK();
+    float tx = cur.x + dx;
+    float ty = cur.y + dy;
+    float tz = cur.z + dz;
+    float trx = cur.rx + drx;
+    float try_deg = cur.ry + dry;
+
+    int s[5];
+    if (!solveIK6DOF(tx, ty, tz, trx, try_deg, s)) return;
+
+    for (int i = 0; i < 5; i++) setServo(i, s[i]);
+    ikJogActive = true;
+    pendingBroadcast = true;
+}
+
 void moveToXYZ(float x, float y, float z, float ry_deg, bool fixed_ry) {
     int s[5];
     if (!solveIK(x, y, z, ry_deg, fixed_ry, s)) {
