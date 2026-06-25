@@ -3,6 +3,23 @@
 #include "globals.h"
 #include <math.h>
 
+// ── Link geometry (mm) — measured from the physical arm.
+// L4 ends at the wrist roll motor center; the gripper beyond that is a tool
+// offset added later by pick-and-place code, not part of FK.
+constexpr float L1 = 43.0f;   // base axis → shoulder pivot
+constexpr float L2 = 83.0f;   // upper arm: shoulder → elbow
+constexpr float L3 = 77.0f;   // forearm:   elbow → wrist pitch axis
+constexpr float L4 = 68.0f;   // wrist:     wrist pitch axis → wrist roll center
+
+// ── Joint zero offsets (logical degrees that correspond to FK "zero").
+// Reference pose (all zeros) = arm pointing straight up along +Z, base
+// forward along +X, wrist roll centered. Calibrated in a later phase.
+constexpr float Z_BASE     = 135.0f;
+constexpr float Z_SHOULDER =  90.0f;
+constexpr float Z_ELBOW    =  90.0f;
+constexpr float Z_W_PITCH  =  90.0f;
+constexpr float Z_W_ROLL   =  90.0f;
+
 // ── Joint table ─────────────────────────────────────────────────────────────
 // minUs/maxUs are physical pulse-width calibration; counts derived per-tick.
 Joint joints[6] = {
@@ -12,7 +29,7 @@ Joint joints[6] = {
     { "Elbow",          1,   0, 180,  86,  86,  false,  342, 2686 },
     { "Wrist Pitch",    2,   0, 180,  86,  86,  false,  342, 2686 },
     { "Wrist Roll",     3,   0, 180,  86,  86,  false,  342, 2686 },
-    { "Gripper",        4,   0,  90,   0,   0,  false,  342, 1514 },
+    { "Gripper",        4,   32,  90,   0,   0,  false,  342, 1514 },
 };
 
 // ── Smooth motion state
@@ -266,6 +283,41 @@ void processMotion() {
         }
     }
     if (moved) pendingBroadcast = true;
+}
+
+// ── Forward kinematics ──────────────────────────────────────────────────────
+// Planar 4-link chain (shoulder/elbow/wrist-pitch + wrist offset) in the arm's
+// vertical plane, then rotated about Z by the base angle. Each pitch joint
+// is measured from +Z, so total tool tilt = θ2 + θ3 + θ4. Wrist roll is on
+// the tool axis — it changes orientation but not the wrist-center position.
+Pose3D computeFK() {
+    const float D2R = (float)M_PI / 180.0f;
+    float t1 = (servoCur[0] - Z_BASE)     * D2R;
+    float t2 = (servoCur[1] - Z_SHOULDER) * D2R;
+    float t3 = (servoCur[2] - Z_ELBOW)    * D2R;
+    float t4 = (servoCur[3] - Z_W_PITCH)  * D2R;
+    float t5 = (servoCur[4] - Z_W_ROLL)   * D2R;
+
+    float a23  = t2 + t3;
+    float a234 = a23 + t4;
+    float r = L2*sinf(t2) + L3*sinf(a23) + L4*sinf(a234);
+    float z = L1 + L2*cosf(t2) + L3*cosf(a23) + L4*cosf(a234);
+
+    Pose3D p;
+    p.x  = r * cosf(t1);
+    p.y  = r * sinf(t1);
+    p.z  = z;
+    p.rx = t5   / D2R;   // tool roll
+    p.ry = a234 / D2R;   // tool pitch from vertical (0=up, 90=horizontal)
+    p.rz = t1   / D2R;   // base yaw from +X
+    return p;
+}
+
+void printFK() {
+    Pose3D p = computeFK();
+    Serial.printf("X: %ld mm, Y: %ld mm, Z: %ld mm | Rx: %ld, Ry: %ld, Rz: %ld\n",
+        lroundf(p.x),  lroundf(p.y),  lroundf(p.z),
+        lroundf(p.rx), lroundf(p.ry), lroundf(p.rz));
 }
 
 // ── Recording ───────────────────────────────────────────────────────────────

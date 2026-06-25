@@ -37,6 +37,7 @@ QueueHandle_t           wsQueue    = nullptr;
 bool                    pendingBroadcast = false;
 
 static uint32_t lastBroadMs = 0;
+static uint32_t lastFkMs    = 0;
 
 // ─── Setup ──────────────────────────────────────────────────────────────────
 void setup() {
@@ -169,5 +170,10 @@ void loop() {
         broadcastStatus();
         lastBroadMs      = millis();
         pendingBroadcast = false;
+    }
+
+    if (millis() - lastFkMs >= 500) {
+        printFK();
+        lastFkMs = millis();
     }
 }

@@ -57,3 +57,14 @@ void saveToFlash();
 void loadFromFlash();
 void processPlayback();
 void playPreset(uint8_t idx);                 // 1-pose → staged move; multi-pose → playback
+
+// ── Forward kinematics
+// Position = wrist roll motor center (NOT gripper tip — tool offset is applied
+// separately by callers that need the tip, e.g. pick-and-place targeting).
+struct Pose3D {
+    float x, y, z;     // mm — origin = base servo axis, Z up, +X = "forward"
+    float rx, ry, rz;  // deg — RPY: roll about tool, pitch from vertical, yaw about Z
+};
+
+Pose3D computeFK();    // reads servoCur[]
+void   printFK();      // emits the spec'd serial line
