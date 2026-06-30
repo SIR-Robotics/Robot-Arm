@@ -84,14 +84,27 @@ button.amb.on{background:linear-gradient(180deg,#e6a817,#c08810);color:#111;bord
 <div class=p><h2>FK Position</h2><div id=fk style="font-family:Consolas,monospace;font-size:.82rem;color:var(--ac3);text-align:center;letter-spacing:.4px">--</div></div>
 <div class=p><h2>Fine Jog</h2><div id=fjp></div></div>
 <div class=p><h2>IK Move</h2>
- <div style="display:grid;grid-template-columns:repeat(4,1fr) 70px;gap:6px;align-items:center;margin-bottom:7px">
+ <div style="display:grid;grid-template-columns:repeat(3,1fr) 70px;gap:6px;align-items:center;margin-bottom:7px">
   <input id=mvx type=number placeholder=X step=1 class=ri style="width:auto">
   <input id=mvy type=number placeholder=Y step=1 class=ri style="width:auto">
   <input id=mvz type=number placeholder=Z step=1 class=ri style="width:auto">
-  <input id=mvr type=number placeholder=Ry step=1 class=ri style="width:auto">
-  <button class=grn onclick=mv()>GO</button>
+  <button class=grn id=mvgo onclick=mv()>GO</button>
  </div>
- <div class=kbd>Ry empty = free wrist pitch (wider reach)</div>
+ <div style="display:grid;grid-template-columns:repeat(3,1fr) 70px;gap:6px;align-items:center;margin-bottom:7px">
+  <input id=mvrx type=number placeholder=Rx step=1 class=ri style="width:auto" title="Wrist roll (optional)">
+  <input id=mvr type=number placeholder=Ry step=1 class=ri style="width:auto" title="Tool pitch (optional, empty=free)">
+  <input id=mvrz type=number placeholder=Rz step=1 class=ri style="width:auto" title="Base yaw check (optional)">
+  <label style="font-size:.7rem;color:#789;display:flex;align-items:center;gap:4px;cursor:pointer"><input type=checkbox id=mvln><span>LINE</span></label>
+ </div>
+ <div style="display:flex;gap:7px;align-items:center;margin-bottom:4px">
+  <button class=amb id=mvtool onclick="w('TO:'+(1-tMode));tt(tMode?'Tool OFF':'Tool ON')">🔧 TOOL TIP — OFF</button>
+  <span id=mvfb style="flex:1;font-size:.72rem;color:#789;font-family:Consolas,monospace;text-align:right"></span>
+ </div>
+ <div class=kbd>Ry empty = free wrist pitch (wider reach) · LINE = straight-line interpolated path</div>
+</div>
+<div class=p><h2>Cartesian Jog</h2>
+ <button class=amb id=cartbtn onclick=togCart() style=width:100%>🎯 CARTESIAN JOG — OFF</button>
+ <div class=kbd style=margin-top:5px>When ON: Left stick = X/Y · Right stick ↕ = Z · Triggers = Ry pitch</div>
 </div>
 <div class=p><h2>Presets</h2><div class=g4 id=psg></div><div class=kbd style=margin-top:7px>Tap card to run &mdash; tap name to rename &mdash; long-press to save current pose</div></div>
 <div class=p><h2>Recording <span class=bd id=rc>0</span></h2>
@@ -120,6 +133,7 @@ button.amb.on{background:linear-gradient(180deg,#e6a817,#c08810);color:#111;bord
 const JD=[{n:'BASE',k:'B',mn:0,mx:180,hm:90},{n:'SHOULDER',k:'S',mn:30,mx:150,hm:90},{n:'ELBOW',k:'E',mn:0,mx:135,hm:90},{n:'WRIST P',k:'WP',mn:0,mx:180,hm:90},{n:'WRIST R',k:'WR',mn:0,mx:180,hm:90},{n:'GRIPPER',k:'G',mn:0,mx:90,hm:45}];
 let ps=[],s,rT,lastA=[90,90,90,90,90,45],lastPlayIdx=-1;
 let pst=[{n:'Home',l:1},{n:'Ready',l:1},{n:'Pick',l:1},{n:'Place',l:1}];
+let tMode=0,cMode=0;
 
 // Joint chips — click to manually set angle (server clamps to joint limits)
 const jr=document.getElementById('jr');
@@ -190,6 +204,24 @@ function aS(d){
  if(d.c||d.p){
   if(d.i!==lastPlayIdx){lastPlayIdx=d.i;document.querySelectorAll('.pi').forEach((p,k)=>p.classList.toggle('cur',k===d.i-1))}
  } else if(lastPlayIdx!==-1){lastPlayIdx=-1;document.querySelectorAll('.pi').forEach(p=>p.classList.remove('cur'))}
+ // Tool mode
+ if(typeof d.to==='number'){
+  tMode=d.to;
+  const tb=document.getElementById('mvtool');
+  tb.classList.toggle('on',!!tMode);
+  tb.innerHTML=tMode?'🔧 TOOL TIP — ON':'🔧 TOOL TIP — OFF';
+ }
+ // Cartesian jog mode
+ if(typeof d.cm==='number'){
+  cMode=d.cm;
+  const cb2=document.getElementById('cartbtn');
+  cb2.classList.toggle('on',!!cMode);
+  cb2.innerHTML=cMode?'🎯 CARTESIAN JOG — ON':'🎯 CARTESIAN JOG — OFF';
+  // Update stick labels
+  const ls=document.querySelector('#sL .sub'),rs2=document.querySelector('#sR .sub');
+  if(ls)ls.textContent=cMode?'X / Y':'BASE / SHOULDER';
+  if(rs2)rs2.textContent=cMode?'— / Z':'ELBOW / WRIST P.';
+ }
 }
 function aP(d){ps=d.i||[];document.getElementById('rc').textContent=d.c;rP()}
 function eh(x){return x.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/"/g,'&quot;')}
@@ -211,13 +243,24 @@ function sR(i){
  I.onkeydown=ev=>{if(ev.key==='Enter')I.blur();if(ev.key==='Escape'){I.value=o;I.blur()}ev.stopPropagation()};
 }
 
+// ── Cartesian jog toggle
+function togCart(){w('CM:'+(cMode?0:1))}
+
 // ── XY thumbsticks
 const sticks=[];
 function bindStick(el){
  const jx=+el.dataset.jx,jy=+el.dataset.jy;
  const knob=el.querySelector('.knob');
  const st={el,knob,jx,jy,vx:0,vy:0,lvx:0,lvy:0,active:false,kbx:0,kby:0,gpx:0,gpy:0};
- function send(){w('JX:'+jx+':'+st.vx+':'+jy+':'+(st.vy))}
+ function send(){
+  if(cMode){
+   // Cartesian mode: left stick → X/Y, right stick → ignore X / Y → Z
+   if(jx===0){w('CJ:'+st.vx+':'+st.vy+':0:0')}  // left stick → dx,dy
+   else{w('CJ:0:0:'+st.vy+':0')}                  // right stick Y → dz
+  }else{
+   w('JX:'+jx+':'+st.vx+':'+jy+':'+(st.vy));
+  }
+ }
  st.send=send;
  function compose(){
   const cx=st.dx||st.kbx||st.gpx, cy=st.dy||st.kby||st.gpy;
@@ -257,7 +300,14 @@ const trigs=[];
 function bindTrig(el){
  const j=+el.dataset.j,nb=el.querySelector('.tnb');
  const tg={el,nb,j,v:0,lv:0,kb:0,gp:0,L:0};
- function send(){w('JG:'+j+':'+tg.v)}
+ function send(){
+  if(cMode){
+   // Cartesian mode: triggers → Ry pitch
+   w('CJ:0:0:0:'+tg.v);
+  }else{
+   w('JG:'+j+':'+tg.v);
+  }
+ }
  tg.send=send;
  function pos(){
   const cy=tg.dy!==undefined?tg.dy:(tg.kb||tg.gp);
@@ -456,8 +506,30 @@ function mv(){
  const y=+document.getElementById('mvy').value||0;
  const z=+document.getElementById('mvz').value||0;
  const rv=document.getElementById('mvr').value.trim();
- if(rv){w('MV:'+x+':'+y+':'+z+':'+rv);tt('IK '+x+','+y+','+z+' Ry='+rv)}
- else{w('MV:'+x+':'+y+':'+z);tt('IK '+x+','+y+','+z+' free Ry')}
+ const rxv=document.getElementById('mvrx').value.trim();
+ const rzv=document.getElementById('mvrz').value.trim();
+ const isLine=document.getElementById('mvln').checked;
+ const fb=document.getElementById('mvfb');
+
+ if(isLine){
+  // LINE mode: LN:x:y:z[:ry]
+  if(rv){w('LN:'+x+':'+y+':'+z+':'+rv);fb.textContent='LINE → ('+x+','+y+','+z+') Ry='+rv}
+  else{w('LN:'+x+':'+y+':'+z);fb.textContent='LINE → ('+x+','+y+','+z+') free Ry'}
+  tt('Line move');
+ }else if(rxv&&rv&&rzv){
+  // Full RPY: MV:x:y:z:rx:ry:rz
+  w('MV:'+x+':'+y+':'+z+':'+rxv+':'+rv+':'+rzv);
+  fb.textContent='IK → ('+x+','+y+','+z+') Rx='+rxv+' Ry='+rv+' Rz='+rzv;
+  tt('IK '+x+','+y+','+z+' RPY');
+ }else if(rv){
+  w('MV:'+x+':'+y+':'+z+':'+rv);
+  fb.textContent='IK → ('+x+','+y+','+z+') Ry='+rv;
+  tt('IK '+x+','+y+','+z+' Ry='+rv);
+ }else{
+  w('MV:'+x+':'+y+':'+z);
+  fb.textContent='IK → ('+x+','+y+','+z+') free Ry';
+  tt('IK '+x+','+y+','+z+' free Ry');
+ }
 }
 
 cn();

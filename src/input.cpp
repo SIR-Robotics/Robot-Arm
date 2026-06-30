@@ -20,6 +20,11 @@ int      webJog[6]    = {0,0,0,0,0,0};
 uint32_t lastWebJogMs = 0;
 bool     webJogActive = false;
 
+// ── Cartesian jog state ─────────────────────────────────────────────────────
+bool     cartMode      = false;
+int      cartJog[4]    = {0,0,0,0};    // dx, dy, dz, dry (-100..100)
+bool     cartJogActive = false;
+
 // ── Button debounce timers
 static uint32_t lastSW = 0, lastRec = 0, lastPlay = 0, lastClr = 0, lastCycle = 0;
 
@@ -90,7 +95,7 @@ void processButtons() {
 // webJog[j] is -100..100 from sticks/keyboard/gamepad. Per tick we push the
 // target float by (webJog/100)*WEB_JOG_SPEED. Motion engine catches up.
 void processWebJog() {
-    if (isPlaying || isCycling || presetActive) { webJogActive = false; return; }
+    if (isPlaying || isCycling || presetActive || cartMode) { webJogActive = false; return; }
     if (millis() - lastWebJogMs < WEB_JOG_INTERVAL) return;
     lastWebJogMs = millis();
 

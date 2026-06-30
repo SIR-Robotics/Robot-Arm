@@ -7,7 +7,7 @@
 #include <WiFi.h>
 
 // ── No-heap JSON buffers
-static char statusBuf[300];
+static char statusBuf[340];
 static char posesBuf[3000];
 
 // ── JSON builders ───────────────────────────────────────────────────────────
@@ -16,7 +16,8 @@ const char* buildStatus() {
     snprintf(statusBuf, sizeof(statusBuf),
         "{\"t\":\"s\",\"j\":[%d,%d,%d,%d,%d,%d],"
         "\"m\":%u,\"l\":%d,\"p\":%d,\"c\":%d,\"i\":%d,\"r\":%d,\"b\":%u,"
-        "\"x\":%ld,\"y\":%ld,\"z\":%ld,\"rx\":%ld,\"ry\":%ld,\"rz\":%ld}",
+        "\"x\":%ld,\"y\":%ld,\"z\":%ld,\"rx\":%ld,\"ry\":%ld,\"rz\":%ld,"
+        "\"to\":%d,\"ln\":%d,\"cm\":%d}",
         joints[0].cur, joints[1].cur, joints[2].cur,
         joints[3].cur, joints[4].cur, joints[5].cur,
         (unsigned)joyMode, seqLen,
@@ -24,7 +25,8 @@ const char* buildStatus() {
         (int)WiFi.RSSI(),
         (unsigned)bootState,
         lroundf(fk.x),  lroundf(fk.y),  lroundf(fk.z),
-        lroundf(fk.rx), lroundf(fk.ry), lroundf(fk.rz));
+        lroundf(fk.rx), lroundf(fk.ry), lroundf(fk.rz),
+        toolMode ? 1 : 0, lineActive ? 1 : 0, cartMode ? 1 : 0);
     return statusBuf;
 }
 
@@ -85,17 +87,23 @@ void broadcastPresets() {
 //   GT:p               goto pose (smooth ramp; no playback)
 //   PY / ST / CY       play / stop / toggle cycle of live sequence
 //   CL / SA / LD       clear / save / load live sequence
+//   MV:x:y:z[:ry]      IK move; 4 args → fixed Ry, 3 args → free Ry
+//   MV:x:y:z:rx:ry:rz  IK move with full RPY (Rx → wrist roll, Rz consistency-checked)
+//   LN:x:y:z[:ry]      LINE — straight-line interpolated move (free or fixed Ry)
+//   TO:0|1             tool-tip mode off / on
+//   CM:0|1             Cartesian jog mode off / on
+//   CJ:dx:dy:dz:dry    Cartesian jog axes (-100..100 each)
 #define TAG(a,b) ((uint16_t)(((a)<<8) | (b)))
 
 void processWsCmd(char* msg) {
     if (msg[0] == 0 || msg[1] == 0) return;
     uint16_t tag = TAG((uint8_t)msg[0], (uint8_t)msg[1]);
 
-    char* args[4] = { nullptr, nullptr, nullptr, nullptr };
+    char* args[6] = { nullptr, nullptr, nullptr, nullptr, nullptr, nullptr };
     if (msg[2] == ':') {
         char* s = msg + 3;
         args[0] = s;
-        for (int i = 1; i < 4 && (s = strchr(s, ':')) != nullptr; i++) {
+        for (int i = 1; i < 6 && (s = strchr(s, ':')) != nullptr; i++) {
             *s++ = '\0';
             args[i] = s;
         }
@@ -190,14 +198,60 @@ void processWsCmd(char* msg) {
         case TAG('C','L'): clearRecording(); broadcastPoses(); break;
         case TAG('S','A'): saveToFlash(); break;
         case TAG('L','D'): loadFromFlash(); broadcastPoses(); break;
-        case TAG('M','V'): {                             // MV:x:y:z[:ry]  IK move
+        case TAG('M','V'): {                             // MV:x:y:z[:ry] OR MV:x:y:z:rx:ry:rz
+            if (!args[0] || !args[1] || !args[2]) break;
+            float x = atof(args[0]);
+            float y = atof(args[1]);
+            float z = atof(args[2]);
+            if (args[3] && args[4] && args[5]) {
+                // Full RPY form: x:y:z:rx:ry:rz
+                float rx = atof(args[3]);
+                float ry = atof(args[4]);
+                float rz = atof(args[5]);
+                moveToXYZ(x, y, z, ry, /*fixed_ry=*/true, rx, rz);
+            } else if (args[3]) {
+                // Legacy 4-arg form: x:y:z:ry
+                moveToXYZ(x, y, z, atof(args[3]), /*fixed_ry=*/true);
+            } else {
+                // 3-arg form: free Ry
+                moveToXYZ(x, y, z, 0.0f, /*fixed_ry=*/false);
+            }
+            break;
+        }
+        case TAG('L','N'): {                             // LN:x:y:z[:ry]  straight-line move
             if (!args[0] || !args[1] || !args[2]) break;
             float x = atof(args[0]);
             float y = atof(args[1]);
             float z = atof(args[2]);
             bool fixed = (args[3] != nullptr);
             float ry = fixed ? atof(args[3]) : 0.0f;
-            moveToXYZ(x, y, z, ry, fixed);
+            startLine(x, y, z, ry, fixed);
+            break;
+        }
+        case TAG('T','O'): {                             // TO:0|1  tool mode
+            if (!args[0]) break;
+            toolMode = (atoi(args[0]) != 0);
+            Serial.printf("[TOOL] %s\n", toolMode ? "ON" : "OFF");
+            pendingBroadcast = true;
+            break;
+        }
+        case TAG('C','M'): {                             // CM:0|1  Cartesian jog mode
+            if (!args[0]) break;
+            cartMode = (atoi(args[0]) != 0);
+            if (!cartMode) {
+                for (int i = 0; i < 4; i++) cartJog[i] = 0;
+                cartJogActive = false;
+            }
+            Serial.printf("[CART] %s\n", cartMode ? "ON" : "OFF");
+            pendingBroadcast = true;
+            break;
+        }
+        case TAG('C','J'): {                             // CJ:dx:dy:dz:dry  Cartesian jog axes
+            if (!args[0] || !args[1] || !args[2] || !args[3]) break;
+            cartJog[0] = constrain(atoi(args[0]), -100, 100);
+            cartJog[1] = constrain(atoi(args[1]), -100, 100);
+            cartJog[2] = constrain(atoi(args[2]), -100, 100);
+            cartJog[3] = constrain(atoi(args[3]), -100, 100);
             break;
         }
     }
@@ -328,6 +382,9 @@ static void printHelp() {
     Serial.println(F("  MOVE                show current XYZ + Rxyz"));
     Serial.println(F("  MOVE x y z          IK move (free Ry — wider reach)"));
     Serial.println(F("  MOVE x y z ry       IK move with tool pitch pinned"));
+    Serial.println(F("  MOVE x y z rx ry rz IK move with full RPY (Rx→wrist roll, Rz checked)"));
+    Serial.println(F("  LINE x y z [ry]     straight-line interpolated IK move"));
+    Serial.println(F("  TOOL [ON|OFF]       show/set tool-tip IK mode (TOOL_OFFSET=111mm)"));
     Serial.println(F("  INVERT <j>          toggle joint direction"));
     Serial.println(F("  SPEED [deg/sec]     get/set motion engine speed"));
     Serial.println(F("  TEST                lo→home→hi sweep per joint"));
@@ -521,7 +578,29 @@ void processSerial() {
             lroundf(p.rx), lroundf(p.ry), lroundf(p.rz));
     }
     else if (cmd.startsWith("MOVE ")) {
-        // 3 args → free-Ry (wider reach); 4 args → fixed-Ry (tool orientation pinned)
+        // 3 args → free-Ry; 4 args → fixed-Ry; 6 args → full RPY (x y z rx ry rz)
+        float v[6] = {0, 0, 0, 0, 0, 0};
+        int n = 0, p = 5;
+        while (n < 6) {
+            int q = cmd.indexOf(' ', p);
+            v[n++] = (q < 0 ? cmd.substring(p) : cmd.substring(p, q)).toFloat();
+            if (q < 0) break;
+            p = q + 1;
+        }
+        if (n < 3) {
+            Serial.println("Usage: MOVE x y z [ry]   or   MOVE x y z rx ry rz");
+        } else if (n == 3) {
+            moveToXYZ(v[0], v[1], v[2], 0.0f, /*fixed_ry=*/false);
+        } else if (n == 4) {
+            moveToXYZ(v[0], v[1], v[2], v[3], /*fixed_ry=*/true);
+        } else if (n == 6) {
+            moveToXYZ(v[0], v[1], v[2], v[4], /*fixed_ry=*/true, v[3], v[5]);
+        } else {
+            Serial.println("Usage: MOVE x y z [ry]   or   MOVE x y z rx ry rz");
+        }
+    }
+    else if (cmd.startsWith("LINE ")) {
+        // LINE x y z [ry]  — straight-line interpolated move
         float v[4] = {0, 0, 0, 0};
         int n = 0, p = 5;
         while (n < 4) {
@@ -530,10 +609,19 @@ void processSerial() {
             if (q < 0) break;
             p = q + 1;
         }
-        if (n < 3) {
-            Serial.println("Usage: MOVE <x> <y> <z> [ry]   (4th arg = pin tool pitch)");
+        if (n < 3) Serial.println("Usage: LINE x y z [ry]");
+        else       startLine(v[0], v[1], v[2], v[3], /*fixed_ry=*/ n >= 4);
+    }
+    else if (cmd.startsWith("TOOL")) {
+        if (cmd.length() <= 4) {
+            Serial.printf("[TOOL] mode = %s (offset = %.0f mm)\n",
+                          toolMode ? "ON" : "OFF", 111.0f);
         } else {
-            moveToXYZ(v[0], v[1], v[2], v[3], /*fixed_ry=*/ n >= 4);
+            String arg = cmd.substring(5); arg.trim();
+            if      (arg == "ON")  { toolMode = true;  Serial.println("[TOOL] ON");  }
+            else if (arg == "OFF") { toolMode = false; Serial.println("[TOOL] OFF"); }
+            else Serial.println("Usage: TOOL [ON|OFF]");
+            pendingBroadcast = true;
         }
     }
     else if (cmd == "HELP") printHelp();

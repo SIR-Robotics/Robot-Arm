@@ -69,11 +69,39 @@ struct Pose3D {
 Pose3D computeFK();    // reads servoCur[]
 void   printFK();      // emits the spec'd serial line (only when value changed)
 
+// ── Tool-tip mode ───────────────────────────────────────────────────────────
+// When true, solveIK / moveToXYZ interpret the (x,y,z) input as the gripper
+// TIP position; the IK back-projects TOOL_OFFSET mm along the tool approach
+// axis to get the wrist roll center, then solves normally. Requires fixed_ry
+// (the approach axis is determined by ry); free-Ry calls are rejected.
+// Default OFF — backwards-compatible with all existing IK callers.
+extern bool toolMode;
+
 // IK: solve joints for an operator-frame target. Returns false if unreachable
 // or if any joint would exceed its [lo, hi]. out_logical[0..4] = base, shoulder,
 // elbow, wrist pitch, wrist roll (logical degrees, ready for setServo).
 //   fixed_ry=true  → constrain tool pitch to ry_deg (uses up the 4th DOF)
 //   fixed_ry=false → wrist pitch held neutral (t4=0); ry_deg is ignored;
 //                    reach is wider because L4 collapses into a 2-link arm.
-bool solveIK(float x, float y, float z, float ry_deg, bool fixed_ry, int out_logical[5]);
-void moveToXYZ(float x, float y, float z, float ry_deg, bool fixed_ry);  // solve + smooth move
+// rx_deg/rz_deg: if NaN, wrist roll defaults to neutral and Rz is unconstrained.
+// If finite, wrist roll = Z_W_ROLL + rx_deg (after RX_OUT_OFFSET), and Rz must
+// match the implied atan2(x,y) within tolerance — else the solve fails.
+bool solveIK(float x, float y, float z, float ry_deg, bool fixed_ry,
+             float rx_deg, float rz_deg, int out_logical[5]);
+void moveToXYZ(float x, float y, float z, float ry_deg, bool fixed_ry,
+               float rx_deg = NAN, float rz_deg = NAN);
+
+// ── Straight-line motion (LINE) ─────────────────────────────────────────────
+// Drives a Cartesian-linear path from current wrist position to (xt,yt,zt) by
+// IK-solving waypoints at ~LINE_STEP_MM spacing and feeding the motion engine
+// one waypoint at a time. processLine() advances when the previous waypoint
+// settles. Cancelled by any preset/playback start.
+extern bool lineActive;
+bool startLine(float xt, float yt, float zt, float ry_deg, bool fixed_ry);
+void processLine();
+void stopLine();
+
+// ── Cartesian jog ───────────────────────────────────────────────────────────
+// Each tick: read current FK → offset by cartJog[] scaled by CART_JOG_SPEED ×
+// dt → solve IK → push to servoTarget[]. No-op if IK fails (arm stays put).
+void processCartJog();

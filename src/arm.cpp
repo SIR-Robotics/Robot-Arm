@@ -1,5 +1,6 @@
 // ─── arm.cpp — Joint table, smooth motion engine, recording, playback ───────
 #include "arm.h"
+#include "input.h"
 #include "globals.h"
 #include <math.h>
 
@@ -15,21 +16,67 @@ constexpr float L3 = 77.0f;   // forearm:   elbow → wrist pitch axis
 constexpr float L4 = 68.0f;   // wrist:     wrist pitch axis → wrist roll center
 
 // ── Joint zero offsets (logical degrees that correspond to FK "zero").
-// Reference pose (all zeros) = arm pointing straight up along +Z, base
-// forward along +X, wrist roll centered. Calibrated in a later phase.
-constexpr float Z_BASE     = 121.0f;
+// Reference pose (all zeros) = arm pointing straight along +Y forward,
+// wrist roll centered. Calibrated against the operator's "max Y" preset.
 constexpr float Z_SHOULDER =  65.0f;
 constexpr float Z_ELBOW    =  81.0f;
 constexpr float Z_W_PITCH  =  90.0f;
 constexpr float Z_W_ROLL   =  90.0f;
 
+// ── Base yaw — piecewise linear, asymmetric.
+// The base servo's physical mounting is NOT symmetric about forward: the
+// arm hits the mechanical limit at a different distance on each side of
+// the operator's +Y reference. A single Z_BASE offset (the old approach)
+// reads cleanly on one side and drifts on the other. Piecewise scale fixes
+// that: ±90° operator yaw lands exactly on the joint's lo/hi stops,
+// regardless of how off-center forward is.
+//
+//   BASE_FWD       = logical angle where arm physically points +Y forward.
+//   BASE_RIGHT_MAX = logical angle of the right-side mechanical stop (high end).
+//   BASE_LEFT_MAX  = logical angle of the  left-side mechanical stop (low  end).
+//
+// BASE_FWD was measured from the operator-saved "max Y" preset (Base=134°).
+// The two MAX constants currently mirror the joint-table software limits
+// (joints[0].lo / .hi); update them here if the physical stops sit inside
+// those values.
+constexpr float BASE_FWD       = 134.0f;
+constexpr float BASE_RIGHT_MAX = 270.0f;
+constexpr float BASE_LEFT_MAX  =   0.0f;
+
+// Slopes: degrees of operator yaw per degree of base servo motion.
+// 90° operator yaw ↔ (MAX − FWD) degrees of physical base rotation,
+// so SCALE = 90 / range. Pre-computed at compile time.
+constexpr float BASE_SCALE_RIGHT = 90.0f / (BASE_RIGHT_MAX - BASE_FWD);  // ≈ 0.662
+constexpr float BASE_SCALE_LEFT  = 90.0f / (BASE_FWD - BASE_LEFT_MAX);   // ≈ 0.672
+
+// Logical-base (servo deg) ↔ operator-yaw (deg) conversion. Branch on
+// which side of forward we're on; each side uses its own slope. These two
+// are inverses of each other across the full physical range.
+static inline float baseLogicalToYaw(float logical) {
+    return (logical >= BASE_FWD)
+        ? (logical - BASE_FWD) * BASE_SCALE_RIGHT
+        : (logical - BASE_FWD) * BASE_SCALE_LEFT;
+}
+static inline float baseYawToLogical(float yaw_deg) {
+    return (yaw_deg >= 0.0f)
+        ? BASE_FWD + yaw_deg / BASE_SCALE_RIGHT
+        : BASE_FWD + yaw_deg / BASE_SCALE_LEFT;
+}
+
 // ── Workspace bias — shifts FK output so the operator's preferred reference
-// pose reads as (X=0, Y=Y_max, Z=0, Ry=0). Decouples kinematic frame from
-// operator frame; tune by snapshotting current FK output at the desired
-// reference pose. Applied as a post-FK subtraction, so kinematic math
-// (sin/cos chain) stays geometrically correct.
+// pose reads as (X=0, Y=Y_max, Z=0, Rx=0, Ry=0, Rz=0). Decouples kinematic
+// frame from operator frame; tune by snapshotting current FK output at the
+// desired reference pose. Applied as a post-FK subtraction, so kinematic
+// math (sin/cos chain) stays geometrically correct.
+//
+// Rx and Rz offsets are currently zero — at the operator's max-Y reference
+// the wrist roll sits at Z_W_ROLL (Rx=0 by construction) and base sits at
+// BASE_FWD (Rz=0 by piecewise mapping). They're parameterised so future
+// reference-pose changes don't require touching the FK math.
 constexpr float Z_OUT_OFFSET  = 150.0f;   // mm — subtracted from FK z
+constexpr float RX_OUT_OFFSET =   0.0f;   // deg — subtracted from FK rx
 constexpr float RY_OUT_OFFSET =  49.0f;   // deg — subtracted from FK ry
+constexpr float RZ_OUT_OFFSET =   0.0f;   // deg — subtracted from FK rz
 
 // ── Joint table ─────────────────────────────────────────────────────────────
 // minUs/maxUs are physical pulse-width calibration; counts derived per-tick.
@@ -47,6 +94,30 @@ Joint joints[6] = {
 float servoCur[6]    = {129, 62, 86, 86, 86, 0};
 float servoTarget[6] = {129, 62, 86, 86, 86, 0};
 float motionSpeed    = 40.0f;         // deg/sec — ~2.25s for a 90° move (matches preset speed)
+
+// ── Tool-tip extension (mm beyond wrist roll center, along tool approach axis).
+// 111 mm = physical gripper length from the wrist roll motor face to the
+// closed-jaw tip. Used by toolMode IK to back-project the input target onto
+// the wrist roll center before the 2-link solver runs.
+constexpr float TOOL_OFFSET = 111.0f;
+bool toolMode = false;
+
+// ── Straight-line motion (LINE)
+constexpr float    LINE_STEP_MM = 10.0f;   // mm of Cartesian path per IK waypoint
+constexpr uint32_t LINE_STEP_MS = 120;     // ms per waypoint (≈ 83 mm/s Cartesian)
+constexpr int      LINE_MAX_STEPS = 200;   // safety cap → 2000 mm path
+
+struct LineState {
+    float x0, y0, z0;        // start (mm) at startLine()
+    float dx, dy, dz;        // mm per step
+    float ry_deg;
+    bool  fixed_ry;
+    int   curStep;
+    int   totalSteps;
+    uint32_t nextMs;
+};
+static LineState line = {};
+bool lineActive = false;
 
 // ── Recording state
 Pose     seq[MAX_POSES];
@@ -303,7 +374,7 @@ void processMotion() {
 // the tool axis — it changes orientation but not the wrist-center position.
 Pose3D computeFK() {
     const float D2R = (float)M_PI / 180.0f;
-    float t1 = (servoCur[0] - Z_BASE)     * D2R;
+    float t1 = baseLogicalToYaw(servoCur[0]) * D2R;
     float t2 = (servoCur[1] - Z_SHOULDER) * D2R;
     float t3 = (servoCur[2] - Z_ELBOW)    * D2R;
     float t4 = (servoCur[3] - Z_W_PITCH)  * D2R;
@@ -318,9 +389,9 @@ Pose3D computeFK() {
     p.x  = r * sinf(t1);              // +X = right (base CW from above)
     p.y  = r * cosf(t1);              // +Y = forward (base θ1=0 → arm along +Y)
     p.z  = z  - Z_OUT_OFFSET;         // shifted: operator reference plane → Z=0
-    p.rx = t5 / D2R;                  // tool roll
-    p.ry = (a234 / D2R) - RY_OUT_OFFSET;  // shifted: operator reference → Ry=0
-    p.rz = t1 / D2R;                  // base yaw from +X
+    p.rx = (t5 / D2R) - RX_OUT_OFFSET;                     // tool roll
+    p.ry = (a234 / D2R) - RY_OUT_OFFSET;                   // tool pitch
+    p.rz = baseLogicalToYaw(servoCur[0]) - RZ_OUT_OFFSET;  // base yaw (piecewise)
     return p;
 }
 
@@ -346,8 +417,43 @@ void printFK() {
 // target (r2, z2), then standard 2-link IK on L2/L3, then back out wrist
 // pitch from the orientation constraint. Elbow-up only — second solution
 // (elbow-down) omitted intentionally for predictability.
-bool solveIK(float x, float y, float z, float ry_deg, bool fixed_ry, int out_logical[5]) {
+//
+// Extended params:
+//   rx_deg — if finite, wrist roll = Z_W_ROLL + rx_deg + RX_OUT_OFFSET (mod invert).
+//            NaN = neutral wrist roll (default).
+//   rz_deg — if finite, validates atan2(x,y) matches it within IK_RZ_TOL_DEG.
+//            NaN = unconstrained (default). On this arm base yaw is fully
+//            determined by (x,y) — Rz is redundant, so this is a consistency
+//            check, not a degree of freedom.
+//   toolMode (file-scope) — if true, (x,y,z) is the gripper TIP, not the
+//            wrist roll center. Back-projects TOOL_OFFSET along the tool
+//            approach axis. Requires fixed_ry to know that axis.
+static constexpr float IK_RZ_TOL_DEG = 1.5f;
+
+bool solveIK(float x, float y, float z, float ry_deg, bool fixed_ry,
+             float rx_deg, float rz_deg, int out_logical[5]) {
     const float D2R = (float)M_PI / 180.0f;
+
+    // Tool-tip → wrist-center back-projection. Tool approach axis lies in the
+    // arm's vertical plane at azimuth atan2(x,y); its tilt from +Z is a234
+    // (=ry_internal). Subtract TOOL_OFFSET projected onto the radial and
+    // z directions. Requires fixed_ry — without it, a234 is determined by
+    // the solver, creating a chicken-and-egg.
+    if (toolMode) {
+        if (!fixed_ry) {
+            Serial.println("[IK] tool mode requires fixed Ry");
+            return false;
+        }
+        float ryi_rad = (ry_deg + RY_OUT_OFFSET) * D2R;
+        float r_tip   = sqrtf(x*x + y*y);
+        if (r_tip < 0.01f) { Serial.println("[IK] tool tip on base axis"); return false; }
+        float r_wrist = r_tip - TOOL_OFFSET * sinf(ryi_rad);
+        float z_wrist = z     - TOOL_OFFSET * cosf(ryi_rad);
+        float scale = r_wrist / r_tip;     // same azimuth, smaller radial
+        x = x * scale;
+        y = y * scale;
+        z = z_wrist;
+    }
 
     // Operator → internal frame (undo the workspace biases)
     float zi = z + Z_OUT_OFFSET;
@@ -355,6 +461,20 @@ bool solveIK(float x, float y, float z, float ry_deg, bool fixed_ry, int out_log
     // Base yaw + radial; +X right, +Y forward → t1 = atan2(x, y)
     float t1 = atan2f(x, y);
     float r  = sqrtf(x*x + y*y);
+
+    // Optional Rz consistency check — operator-supplied Rz must agree with
+    // the implied base yaw (mechanical coupling on this arm).
+    if (!isnan(rz_deg)) {
+        float t1_deg = t1 / D2R;
+        float diff   = rz_deg + RZ_OUT_OFFSET - t1_deg;
+        while (diff >  180.0f) diff -= 360.0f;
+        while (diff < -180.0f) diff += 360.0f;
+        if (fabsf(diff) > IK_RZ_TOL_DEG) {
+            Serial.printf("[IK] Rz=%.1f inconsistent with atan2(x,y)=%.1f (diff=%.1f > %.1f)\n",
+                          rz_deg, t1_deg, diff, IK_RZ_TOL_DEG);
+            return false;
+        }
+    }
 
     float t2, t3, t4;
 
@@ -389,39 +509,163 @@ bool solveIK(float x, float y, float z, float ry_deg, bool fixed_ry, int out_log
         t4 = 0.0f;
     }
 
-    out_logical[0] = (int)lroundf(t1 / D2R + Z_BASE);
+    // Wrist roll: caller-supplied Rx, or neutral. 1:1 mapping (no nonlinearity
+    // expected on the WR joint).
+    float wr_deg = isnan(rx_deg)
+        ? Z_W_ROLL
+        : (Z_W_ROLL + rx_deg + RX_OUT_OFFSET);
+
+    out_logical[0] = (int)lroundf(baseYawToLogical(t1 / D2R));
     out_logical[1] = (int)lroundf(t2 / D2R + Z_SHOULDER);
     out_logical[2] = (int)lroundf(t3 / D2R + Z_ELBOW);
     out_logical[3] = (int)lroundf(t4 / D2R + Z_W_PITCH);
-    out_logical[4] = (int)lroundf(Z_W_ROLL);            // hold wrist roll neutral
+    out_logical[4] = (int)lroundf(wr_deg);
 
     for (int i = 0; i < 5; i++) {
         if (out_logical[i] < joints[i].lo || out_logical[i] > joints[i].hi) {
-            return false;                               // joint stop blocks it
+            Serial.printf("[IK] joint %d (%s) out of range: %d ∉ [%d, %d]\n",
+                          i, joints[i].name, out_logical[i], joints[i].lo, joints[i].hi);
+            return false;
         }
     }
     return true;
 }
 
-void moveToXYZ(float x, float y, float z, float ry_deg, bool fixed_ry) {
+void moveToXYZ(float x, float y, float z, float ry_deg, bool fixed_ry,
+               float rx_deg, float rz_deg) {
     int s[5];
-    if (!solveIK(x, y, z, ry_deg, fixed_ry, s)) {
-        if (fixed_ry) {
-            Serial.printf("[IK] unreachable: (%.0f, %.0f, %.0f, Ry=%.0f)\n",
-                          x, y, z, ry_deg);
-        } else {
-            Serial.printf("[IK] unreachable: (%.0f, %.0f, %.0f) free-Ry\n",
-                          x, y, z);
-        }
+    if (!solveIK(x, y, z, ry_deg, fixed_ry, rx_deg, rz_deg, s)) {
+        Serial.printf("[IK] unreachable: (%.0f,%.0f,%.0f)%s%s\n",
+                      x, y, z,
+                      fixed_ry ? " Ry=fixed" : "",
+                      toolMode ? " tool=ON" : "");
         return;
     }
-    if (fixed_ry) {
-        Serial.printf("[IK] (%.0f, %.0f, %.0f, Ry=%.0f) -> base=%d sh=%d el=%d wp=%d wr=%d\n",
-                      x, y, z, ry_deg, s[0], s[1], s[2], s[3], s[4]);
-    } else {
-        Serial.printf("[IK] (%.0f, %.0f, %.0f) free-Ry -> base=%d sh=%d el=%d wp=%d wr=%d\n",
-                      x, y, z, s[0], s[1], s[2], s[3], s[4]);
+    Serial.printf("[IK] (%.0f,%.0f,%.0f%s%s%s%s) -> base=%d sh=%d el=%d wp=%d wr=%d\n",
+                  x, y, z,
+                  fixed_ry        ? " Ry" : "",
+                  !isnan(rx_deg)  ? " Rx" : "",
+                  !isnan(rz_deg)  ? " Rz" : "",
+                  toolMode        ? " tool" : "",
+                  s[0], s[1], s[2], s[3], s[4]);
+    for (int i = 0; i < 5; i++) setServo(i, s[i]);
+    pendingBroadcast = true;
+}
+
+// ── Straight-line interpolator ──────────────────────────────────────────────
+// Computes the current wrist position via FK, splits the segment to (xt,yt,zt)
+// into LINE_STEP_MM chunks, and pushes one IK solution per LINE_STEP_MS tick
+// into the motion engine. The engine ramps between consecutive waypoints, so
+// the tool traces a polyline that approximates a straight line in Cartesian
+// space.
+//
+// Cancellation: presets / playback / cycle stop the line implicitly via the
+// guard in processLine(); call stopLine() to cancel from a handler.
+bool startLine(float xt, float yt, float zt, float ry_deg, bool fixed_ry) {
+    Pose3D p = computeFK();
+    float dx_t = xt - p.x, dy_t = yt - p.y, dz_t = zt - p.z;
+    float dist = sqrtf(dx_t*dx_t + dy_t*dy_t + dz_t*dz_t);
+    if (dist < 1.0f) { Serial.println("[LINE] already at target"); return false; }
+
+    int steps = (int)ceilf(dist / LINE_STEP_MM);
+    if (steps > LINE_MAX_STEPS) {
+        Serial.printf("[LINE] path too long (%d steps > %d)\n", steps, LINE_MAX_STEPS);
+        return false;
     }
+
+    // Sanity-check the endpoint before moving — cheaper than failing mid-path.
+    int s[5];
+    if (!solveIK(xt, yt, zt, ry_deg, fixed_ry, NAN, NAN, s)) {
+        Serial.println("[LINE] endpoint unreachable — aborting");
+        return false;
+    }
+
+    line.x0 = p.x; line.y0 = p.y; line.z0 = p.z;
+    line.dx = dx_t / steps;
+    line.dy = dy_t / steps;
+    line.dz = dz_t / steps;
+    line.ry_deg     = ry_deg;
+    line.fixed_ry   = fixed_ry;
+    line.curStep    = 1;
+    line.totalSteps = steps;
+    line.nextMs     = millis();
+    lineActive      = true;
+    Serial.printf("[LINE] %d steps × %.1f mm -> (%.0f,%.0f,%.0f)\n",
+                  steps, dist / steps, xt, yt, zt);
+    return true;
+}
+
+void stopLine() {
+    if (lineActive) Serial.println("[LINE] stopped");
+    lineActive = false;
+}
+
+void processLine() {
+    if (!lineActive) return;
+    if (presetActive || isPlaying || isCycling) { stopLine(); return; }
+    if (millis() < line.nextMs) return;
+
+    float x = line.x0 + line.dx * line.curStep;
+    float y = line.y0 + line.dy * line.curStep;
+    float z = line.z0 + line.dz * line.curStep;
+
+    int s[5];
+    if (!solveIK(x, y, z, line.ry_deg, line.fixed_ry, NAN, NAN, s)) {
+        Serial.printf("[LINE] waypoint %d unreachable, stopping\n", line.curStep);
+        lineActive = false;
+        return;
+    }
+    for (int i = 0; i < 5; i++) setServo(i, s[i]);
+    pendingBroadcast = true;
+
+    if (line.curStep >= line.totalSteps) {
+        Serial.println("[LINE] Done");
+        lineActive = false;
+    } else {
+        line.curStep++;
+        line.nextMs = millis() + LINE_STEP_MS;
+    }
+}
+
+// ── Cartesian jog engine ────────────────────────────────────────────────────
+// Each tick: FK → offset by cartJog[] → IK → servoTarget[]. Rate-limited to
+// ~50 Hz. If IK fails the arm simply stays put (no error flood). Ry is
+// managed as a delta too, so the operator can tilt the tool while jogging.
+// The jog speed is in mm/tick at full deflection (100); at 50 Hz, 2 mm/tick
+// ≈ 100 mm/s Cartesian velocity — comfortable for a desktop arm.
+constexpr float CART_JOG_SPEED_MM  = 2.0f;   // mm per tick at full deflection
+constexpr float CART_JOG_SPEED_DEG = 1.5f;   // deg per tick at full Ry deflection
+constexpr uint32_t CART_JOG_INTERVAL = 20;   // ms — 50 Hz
+
+void processCartJog() {
+    if (!cartMode) { cartJogActive = false; return; }
+    if (isPlaying || isCycling || presetActive || lineActive) {
+        cartJogActive = false; return;
+    }
+
+    static uint32_t lastMs = 0;
+    if (millis() - lastMs < CART_JOG_INTERVAL) return;
+    lastMs = millis();
+
+    bool any = false;
+    for (int i = 0; i < 4; i++) if (cartJog[i] != 0) { any = true; break; }
+    cartJogActive = any;
+    if (!any) return;
+
+    // Current Cartesian position from FK
+    Pose3D p = computeFK();
+
+    // Apply deltas (normalised -100..100 → -1..1 × speed)
+    float nx = p.x  + (cartJog[0] / 100.0f) * CART_JOG_SPEED_MM;
+    float ny = p.y  + (cartJog[1] / 100.0f) * CART_JOG_SPEED_MM;
+    float nz = p.z  + (cartJog[2] / 100.0f) * CART_JOG_SPEED_MM;
+    float nry = p.ry + (cartJog[3] / 100.0f) * CART_JOG_SPEED_DEG;
+
+    // Solve IK — fixed Ry so orientation tracks the jog
+    int s[5];
+    if (!solveIK(nx, ny, nz, nry, /*fixed_ry=*/true, NAN, NAN, s)) return;
+
+    // Push to motion engine
     for (int i = 0; i < 5; i++) setServo(i, s[i]);
     pendingBroadcast = true;
 }

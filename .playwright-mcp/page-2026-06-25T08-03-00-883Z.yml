@@ -1,0 +1,133 @@
+- generic [active] [ref=e1]:
+  - generic [ref=e2]:
+    - generic [ref=e4]: ROBOARM
+    - generic [ref=e5]: IDLE
+    - generic [ref=e6]: "--"
+    - generic [ref=e7]: RSSI -55 dBm
+  - generic [ref=e8]:
+    - generic "Tap to set angle" [ref=e9] [cursor=pointer]:
+      - generic [ref=e10]: B
+      - generic [ref=e11]: 134°
+    - generic "Tap to set angle" [ref=e12] [cursor=pointer]:
+      - generic [ref=e13]: S
+      - generic [ref=e14]: 65°
+    - generic "Tap to set angle" [ref=e15] [cursor=pointer]:
+      - generic [ref=e16]: E
+      - generic [ref=e17]: 81°
+    - generic "Tap to set angle" [ref=e18] [cursor=pointer]:
+      - generic [ref=e19]: WP
+      - generic [ref=e20]: 90°
+    - generic "Tap to set angle" [ref=e21] [cursor=pointer]:
+      - generic [ref=e22]: WR
+      - generic [ref=e23]: 90°
+    - generic "Tap to set angle" [ref=e24] [cursor=pointer]:
+      - generic [ref=e25]: G
+      - generic [ref=e26]: 83°
+  - generic [ref=e27]:
+    - generic [ref=e28]:
+      - generic [ref=e29]: LEFT STICK
+      - generic [ref=e30]: BASE / SHOULDER
+      - generic [ref=e33]: WASD
+    - generic [ref=e34]:
+      - generic [ref=e35]: RIGHT STICK
+      - generic [ref=e36]: ELBOW / WRIST P.
+      - generic [ref=e39]: IJKL
+  - generic [ref=e40]:
+    - generic [ref=e41]:
+      - generic [ref=e42]: WRIST ROLL
+      - generic [ref=e45]: QE
+    - generic [ref=e46]:
+      - generic [ref=e47]: GRIPPER
+      - generic [ref=e50]: ZX
+  - generic [ref=e51]:
+    - heading "FK Position" [level=2] [ref=e52]
+    - generic [ref=e53]: "X: 0 mm Y: 0 mm Z: 78 mm | Rx: 0° Ry: -49° Rz: 13°"
+  - generic [ref=e54]:
+    - heading "Fine Jog" [level=2] [ref=e55]
+    - generic [ref=e56]:
+      - generic [ref=e57]:
+        - generic [ref=e58]: B
+        - generic [ref=e59]: 134°
+        - button "-5" [ref=e60] [cursor=pointer]
+        - button "-1" [ref=e61] [cursor=pointer]
+        - button "+1" [ref=e62] [cursor=pointer]
+        - button "+5" [ref=e63] [cursor=pointer]
+      - generic [ref=e64]:
+        - generic [ref=e65]: S
+        - generic [ref=e66]: 65°
+        - button "-5" [ref=e67] [cursor=pointer]
+        - button "-1" [ref=e68] [cursor=pointer]
+        - button "+1" [ref=e69] [cursor=pointer]
+        - button "+5" [ref=e70] [cursor=pointer]
+      - generic [ref=e71]:
+        - generic [ref=e72]: E
+        - generic [ref=e73]: 81°
+        - button "-5" [ref=e74] [cursor=pointer]
+        - button "-1" [ref=e75] [cursor=pointer]
+        - button "+1" [ref=e76] [cursor=pointer]
+        - button "+5" [ref=e77] [cursor=pointer]
+      - generic [ref=e78]:
+        - generic [ref=e79]: WP
+        - generic [ref=e80]: 90°
+        - button "-5" [ref=e81] [cursor=pointer]
+        - button "-1" [ref=e82] [cursor=pointer]
+        - button "+1" [ref=e83] [cursor=pointer]
+        - button "+5" [ref=e84] [cursor=pointer]
+      - generic [ref=e85]:
+        - generic [ref=e86]: WR
+        - generic [ref=e87]: 90°
+        - button "-5" [ref=e88] [cursor=pointer]
+        - button "-1" [ref=e89] [cursor=pointer]
+        - button "+1" [ref=e90] [cursor=pointer]
+        - button "+5" [ref=e91] [cursor=pointer]
+      - generic [ref=e92]:
+        - generic [ref=e93]: G
+        - generic [ref=e94]: 83°
+        - button "-5" [ref=e95] [cursor=pointer]
+        - button "-1" [ref=e96] [cursor=pointer]
+        - button "+1" [ref=e97] [cursor=pointer]
+        - button "+5" [ref=e98] [cursor=pointer]
+  - generic [ref=e99]:
+    - heading "IK Move" [level=2] [ref=e100]
+    - generic [ref=e101]:
+      - spinbutton [ref=e102]
+      - spinbutton [ref=e103]
+      - spinbutton [ref=e104]
+      - spinbutton [ref=e105]
+      - button "GO" [ref=e106] [cursor=pointer]
+    - generic [ref=e107]: Ry empty = free wrist pitch (wider reach)
+  - generic [ref=e108]:
+    - heading "Presets" [level=2] [ref=e109]
+    - generic [ref=e110]:
+      - button "Home 1 pose" [ref=e111] [cursor=pointer]:
+        - generic [ref=e112]: Home
+        - generic [ref=e113]: 1 pose
+      - button "Home Play Home 9 poses" [ref=e114] [cursor=pointer]:
+        - generic [ref=e115]: Home Play Home
+        - generic [ref=e116]: 9 poses
+      - button "max Y 1 pose" [ref=e117] [cursor=pointer]:
+        - generic [ref=e118]: max Y
+        - generic [ref=e119]: 1 pose
+      - button "Place 1 pose" [ref=e120] [cursor=pointer]:
+        - generic [ref=e121]: Place
+        - generic [ref=e122]: 1 pose
+    - generic [ref=e123]: Tap card to run — tap name to rename — long-press to save current pose
+  - generic [ref=e124]:
+    - heading "Recording 0" [level=2] [ref=e125]:
+      - text: Recording
+      - generic [ref=e126]: "0"
+    - generic [ref=e127]:
+      - button "● REC" [ref=e128] [cursor=pointer]
+      - button "▶ Play" [ref=e129] [cursor=pointer]
+      - button "▮▮ Stop" [ref=e130] [cursor=pointer]
+      - button "🗑 Clear" [ref=e131] [cursor=pointer]
+    - button "▶▶ CYCLE LOOP — OFF" [ref=e132] [cursor=pointer]
+    - generic [ref=e133]:
+      - button "💾 Save" [ref=e134] [cursor=pointer]
+      - button "📤 Load" [ref=e135] [cursor=pointer]
+    - generic [ref=e136]:
+      - button "⬇ Export JSON" [ref=e137] [cursor=pointer]
+      - button "⬆ Import JSON" [ref=e138] [cursor=pointer]
+    - button "💾 Save sequence to preset…" [ref=e139] [cursor=pointer]
+    - generic [ref=e140]: SPACErec Pplay Ostop Ccycle Hhome
+  - generic: Connected

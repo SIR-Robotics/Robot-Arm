@@ -141,15 +141,17 @@ void loop() {
     if (bootState != STATE_FAULT) {
         processJoystick();
         processWebJog();
+        processCartJog();     // Cartesian IK jog (no-op when cartMode=false)
         processButtons();
         processPlayback();
         processPresetMove();  // advances staged preset moves between phases
+        processLine();        // straight-line interpolator (no-op when idle)
         processMotion();      // ramps servoCur -> servoTarget at motionSpeed
 
         // Recompute IDLE ↔ BUSY each tick. Only consider transitions once
         // homing is finished — INIT/HOMING/FAULT stay put.
         if (bootState == STATE_IDLE || bootState == STATE_BUSY) {
-            BootState target = (presetActive || isPlaying || isCycling)
+            BootState target = (presetActive || isPlaying || isCycling || lineActive)
                              ? STATE_BUSY : STATE_IDLE;
             if (target != bootState) {
                 bootState = target;
@@ -165,7 +167,7 @@ void loop() {
         lastCleanupMs = millis();
     }
 
-    if ((pendingBroadcast || joyActive || webJogActive)
+    if ((pendingBroadcast || joyActive || webJogActive || cartJogActive)
         && millis() - lastBroadMs >= 50) {
         broadcastStatus();
         lastBroadMs      = millis();

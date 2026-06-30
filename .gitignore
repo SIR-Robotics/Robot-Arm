@@ -11,3 +11,9 @@ skills-lock.json
 docs
 test
 
+# Node.js / Playwright
+node_modules
+test-results
+playwright-report
+package-lock.json
+
