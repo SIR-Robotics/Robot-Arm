@@ -118,6 +118,7 @@ button.amb.on{background:linear-gradient(180deg,#e6a817,#c08810);color:#111;bord
 <div id=toast></div>
 <script>
 const JD=[{n:'BASE',k:'B',mn:0,mx:180,hm:90},{n:'SHOULDER',k:'S',mn:30,mx:150,hm:90},{n:'ELBOW',k:'E',mn:0,mx:135,hm:90},{n:'WRIST P',k:'WP',mn:0,mx:180,hm:90},{n:'WRIST R',k:'WR',mn:0,mx:180,hm:90},{n:'GRIPPER',k:'G',mn:0,mx:90,hm:45}];
+const FKD=['X','Y','Z','Ry','Rx','G'];
 let ps=[],s,rT,lastA=[90,90,90,90,90,45],lastPlayIdx=-1,ikMode=false;
 let ikD=[0,0,0,0,0],likD=[0,0,0,0,0];  // IK deltas + last-sent for dedup
 
@@ -221,7 +222,7 @@ function rP(){
  const e=document.getElementById('pls');e.innerHTML='';
  ps.forEach((p,i)=>{
   const d=document.createElement('div');d.className='pi';
-  d.innerHTML=`<span class=pnn>#${i+1}</span><span class=pll id=pl${i}>${eh(p.n)}</span><span class=pa title="Go to pose">${p.a.map((v,k)=>JD[k].k+v).join(' ')}</span>`;
+  d.innerHTML=`<span class=pnn>#${i+1}</span><span class=pll id=pl${i}>${eh(p.n)}</span><span class=pa title="Go to FK pose">${p.a.map((v,k)=>FKD[k]+v).join(' ')}</span>`;
   d.querySelector('.pll').onclick=()=>sR(i);
   d.querySelector('.pa').onclick=()=>{w('GT:'+i);tt('Go #'+(i+1))};
   e.appendChild(d);

@@ -77,6 +77,7 @@ void   printFK();      // emits the spec'd serial line (only when value changed)
 //                    reach is wider because L4 collapses into a 2-link arm.
 bool solveIK(float x, float y, float z, float ry_deg, bool fixed_ry, int out_logical[5]);
 void moveToXYZ(float x, float y, float z, float ry_deg, bool fixed_ry);  // solve + smooth move
+bool solveRecordedWaypoint(const Pose& pose, int out_logical[5], int* used_ry);
 
 // ── 6-DOF Inverse Kinematics ───────────────────────────────────────────────
 // Full position + orientation IK for all 5 arm joints (gripper excluded).

@@ -30,6 +30,7 @@ constexpr float Z_W_ROLL   =  90.0f;
 // (sin/cos chain) stays geometrically correct.
 constexpr float Z_OUT_OFFSET  = 150.0f;   // mm — subtracted from FK z
 constexpr float RY_OUT_OFFSET =  49.0f;   // deg — subtracted from FK ry
+constexpr float IK_COS_EPS    =   0.02f;  // tolerance for integer-rounded FK waypoints
 
 // ── Joint table ─────────────────────────────────────────────────────────────
 // minUs/maxUs are physical pulse-width calibration; counts derived per-tick.
@@ -58,6 +59,7 @@ uint32_t playNextMs = 0;
 
 Pose* playSrc    = nullptr;
 int   playSrcLen = 0;
+static bool playSrcIsFk = false;
 
 Preset presets[MAX_PRESETS] = {
     { "Home",  1, { { { 129, 62, 86, 86, 86,  0 }, "" } } },
@@ -65,6 +67,12 @@ Preset presets[MAX_PRESETS] = {
     { "Pick",  1, { { {  90, 45, 45, 90, 90,  0 }, "" } } },
     { "Place", 1, { { {  90, 45, 45, 90, 90, 90 }, "" } } },
 };
+
+static bool clampIkCosine(float& c) {
+    if (c < -1.0f - IK_COS_EPS || c > 1.0f + IK_COS_EPS) return false;
+    c = constrain(c, -1.0f, 1.0f);
+    return true;
+}
 
 // ── Servo math ──────────────────────────────────────────────────────────────
 uint16_t toCounts(const Joint& j, int angle) {
@@ -367,7 +375,7 @@ bool solveIK(float x, float y, float z, float ry_deg, bool fixed_ry, int out_log
         float z2 = zi - L4 * cosf(ryi_rad);
         float d2    = r2*r2 + z2*z2;
         float cosT3 = (d2 - L2*L2 - L3*L3) / (2.0f * L2 * L3);
-        if (cosT3 < -1.0f || cosT3 > 1.0f) return false;
+        if (!clampIkCosine(cosT3)) return false;
         t3 = acosf(cosT3);                              // elbow-up
         float A = L2 + L3 * cosf(t3);
         float B = L3 * sinf(t3);
@@ -381,7 +389,7 @@ bool solveIK(float x, float y, float z, float ry_deg, bool fixed_ry, int out_log
         float Le    = L3 + L4;
         float d2    = r*r + zi*zi;
         float cosT3 = (d2 - L2*L2 - Le*Le) / (2.0f * L2 * Le);
-        if (cosT3 < -1.0f || cosT3 > 1.0f) return false;
+        if (!clampIkCosine(cosT3)) return false;
         t3 = acosf(cosT3);                              // elbow-up
         float A = L2 + Le * cosf(t3);
         float B = Le * sinf(t3);
@@ -435,7 +443,7 @@ bool solveIK6DOF(float x, float y, float z, float rx_deg, float ry_deg,
 
     float d2    = r2*r2 + z2*z2;
     float cosT3 = (d2 - L2*L2 - L3*L3) / (2.0f * L2 * L3);
-    if (cosT3 < -1.0f || cosT3 > 1.0f) return false;
+    if (!clampIkCosine(cosT3)) return false;
 
     float t3_options[2] = { acosf(cosT3), -acosf(cosT3) };
 
@@ -548,12 +556,51 @@ void moveToXYZ(float x, float y, float z, float ry_deg, bool fixed_ry) {
 }
 
 // ── Recording ───────────────────────────────────────────────────────────────
+bool solveRecordedWaypoint(const Pose& pose, int out[5], int* usedRy) {
+    const int* a = pose.a; // X,Y,Z,Ry,Rx,Gripper
+    if (usedRy) *usedRy = a[3];
+
+    if (solveIK6DOF((float)a[0], (float)a[1], (float)a[2],
+                    (float)a[4], (float)a[3], out)) {
+        return true;
+    }
+
+    for (int d = 1; d <= 15; d++) {
+        for (int sign = -1; sign <= 1; sign += 2) {
+            int ry = a[3] + sign * d;
+            if (solveIK6DOF((float)a[0], (float)a[1], (float)a[2],
+                            (float)a[4], (float)ry, out)) {
+                if (usedRy) *usedRy = ry;
+                return true;
+            }
+        }
+    }
+
+    if (solveIK((float)a[0], (float)a[1], (float)a[2], 0.0f,
+                /*fixed_ry=*/false, out)) {
+        out[4] = constrain(a[4] + (int)lroundf(Z_W_ROLL), joints[4].lo, joints[4].hi);
+        if (usedRy) *usedRy = 999;
+        return true;
+    }
+
+    return false;
+}
+
 void recordPose() {
     if (seqLen >= MAX_POSES) { Serial.println("[REC] Full"); return; }
-    for (int i = 0; i < 6; i++) seq[seqLen].a[i] = joints[i].cur;
+    Pose3D fk = computeFK();
+    seq[seqLen].a[0] = (int)lroundf(fk.x);
+    seq[seqLen].a[1] = (int)lroundf(fk.y);
+    seq[seqLen].a[2] = (int)lroundf(fk.z);
+    seq[seqLen].a[3] = (int)lroundf(fk.ry);
+    seq[seqLen].a[4] = (int)lroundf(fk.rx);
+    seq[seqLen].a[5] = joints[5].cur;
     snprintf(seq[seqLen].label, sizeof(seq[seqLen].label), "Pose %d", seqLen + 1);
     seqLen++;
-    Serial.printf("[REC] %d total\n", seqLen);
+    Serial.printf("[REC] %d total  FK=(%d,%d,%d Ry=%d Rx=%d G=%d)\n",
+                  seqLen,
+                  seq[seqLen - 1].a[0], seq[seqLen - 1].a[1], seq[seqLen - 1].a[2],
+                  seq[seqLen - 1].a[3], seq[seqLen - 1].a[4], seq[seqLen - 1].a[5]);
     pendingBroadcast = true;
 }
 
@@ -566,6 +613,7 @@ void renamePose(int idx, const char* name) {
 void startPlayback() {
     if (!seqLen) { Serial.println("[PLAY] Empty"); return; }
     playSrc = seq; playSrcLen = seqLen;
+    playSrcIsFk = true;
     isCycling = false; isPlaying = true;
     playIdx = 0; playNextMs = millis();
     pendingBroadcast = true;
@@ -576,6 +624,7 @@ void stopPlayback() { isPlaying = false; isCycling = false; pendingBroadcast = t
 void startCycle() {
     if (!seqLen) { Serial.println("[CYCLE] Empty"); return; }
     playSrc = seq; playSrcLen = seqLen;
+    playSrcIsFk = true;
     isPlaying = false; isCycling = true;
     playIdx = 0; playNextMs = millis();
     pendingBroadcast = true;
@@ -640,6 +689,7 @@ void playPreset(uint8_t idx) {
         // Multi-pose preset → playback through motion engine
         playSrc = presets[idx].seq;
         playSrcLen = presets[idx].len;
+        playSrcIsFk = true;
         isCycling = false; isPlaying = true;
         playIdx = 0; playNextMs = millis();
         pendingBroadcast = true;
@@ -716,7 +766,34 @@ void processPlayback() {
         }
     }
 
-    for (int i = 0; i < 6; i++) setServo(i, playSrc[playIdx].a[i]);   // smooth ramp
+    if (playSrcIsFk) {
+        int s[5];
+        int usedRy = 0;
+        int* a = playSrc[playIdx].a;
+        if (!solveRecordedWaypoint(playSrc[playIdx], s, &usedRy)) {
+            Serial.printf("[%s] %d/%d \"%s\" unreachable FK=(%d,%d,%d Ry=%d Rx=%d)\n",
+                isCycling ? "CYC" : "PLAY", playIdx + 1, playSrcLen, playSrc[playIdx].label,
+                a[0], a[1], a[2], a[3], a[4]);
+            playIdx++;
+            playNextMs = millis() + PLAY_STEP_MS;
+            pendingBroadcast = true;
+            return;
+        }
+        if (usedRy != a[3]) {
+            if (usedRy == 999) {
+                Serial.printf("[%s] %d/%d \"%s\" using position-only IK\n",
+                    isCycling ? "CYC" : "PLAY", playIdx + 1, playSrcLen, playSrc[playIdx].label);
+            } else {
+                Serial.printf("[%s] %d/%d \"%s\" relaxed Ry %d -> %d\n",
+                    isCycling ? "CYC" : "PLAY", playIdx + 1, playSrcLen, playSrc[playIdx].label,
+                    a[3], usedRy);
+            }
+        }
+        for (int i = 0; i < 5; i++) setServo(i, s[i]);
+        setServo(5, a[5]);
+    } else {
+        for (int i = 0; i < 6; i++) setServo(i, playSrc[playIdx].a[i]);   // smooth ramp
+    }
     Serial.printf("[%s] %d/%d \"%s\"\n",
         isCycling ? "CYC" : "PLAY", playIdx + 1, playSrcLen, playSrc[playIdx].label);
     playIdx++;

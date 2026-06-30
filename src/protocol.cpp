@@ -183,7 +183,24 @@ void processWsCmd(char* msg) {
             if (!args[0]) break;
             int p = atoi(args[0]);
             if (p >= 0 && p < seqLen) {
-                for (int i = 0; i < 6; i++) setServo(i, seq[p].a[i]);
+                int s[5];
+                int* a = seq[p].a;
+                int usedRy = 0;
+                if (solveRecordedWaypoint(seq[p], s, &usedRy)) {
+                    for (int i = 0; i < 5; i++) setServo(i, s[i]);
+                    setServo(5, a[5]);
+                    if (usedRy != a[3]) {
+                        if (usedRy == 999) {
+                            Serial.printf("[GT] Pose %d using position-only IK\n", p + 1);
+                        } else {
+                            Serial.printf("[GT] Pose %d relaxed Ry %d -> %d\n",
+                                          p + 1, a[3], usedRy);
+                        }
+                    }
+                } else {
+                    Serial.printf("[GT] Pose %d unreachable FK=(%d,%d,%d Ry=%d Rx=%d)\n",
+                                  p + 1, a[0], a[1], a[2], a[3], a[4]);
+                }
                 pendingBroadcast = true;
             }
             break;
