@@ -31,6 +31,12 @@
 #define WEB_JOG_INTERVAL 25
 #define WEB_JOG_SPEED    1.0f   // 1.0°/25ms = 40°/s, matches motionSpeed cap
 
+// ── IK jog speeds (mm or deg per tick, applied at ~50 Hz when stick is at max)
+#define IK_JOG_SPEED_XY  1.2f   // mm/tick → ~60 mm/s horizontal
+#define IK_JOG_SPEED_Z   0.8f   // mm/tick → ~40 mm/s vertical
+#define IK_JOG_SPEED_RY  0.6f   // deg/tick → ~30 deg/s pitch
+#define IK_JOG_SPEED_RX  0.6f   // deg/tick → ~30 deg/s roll
+
 // ── Recording
 #define MAX_POSES    50
 #define PLAY_STEP_MS 3000       // 3s/pose, enough for 120° move at 40°/s
@@ -55,8 +61,18 @@ struct Joint {
 
 struct Pose { int a[6]; char label[20]; };
 
-#define MAX_PRESETS          4
+#define MAX_PRESETS          7
 #define MAX_POSES_PER_PRESET 30
+
+enum PresetSlot : uint8_t {
+    PRESET_HOME = 0,
+    PRESET_READY,
+    PRESET_PICK,
+    PRESET_PLACE,
+    PRESET_RED,
+    PRESET_YELLOW,
+    PRESET_BLUE,
+};
 
 struct Preset {
     char name[20];

@@ -44,6 +44,9 @@ void setPresetFromCurrent(uint8_t idx);       // 0=home 1=ready 2=pick 3=place
 void renamePreset(uint8_t idx, const char* name);  // writes through to flash
 void savePresetsToFlash();
 void loadPresetsFromFlash();
+void runRed();
+void runYellow();
+void runBlue();
 
 // ── Recording / playback
 void recordPose();
@@ -77,3 +80,18 @@ void   printFK();      // emits the spec'd serial line (only when value changed)
 //                    reach is wider because L4 collapses into a 2-link arm.
 bool solveIK(float x, float y, float z, float ry_deg, bool fixed_ry, int out_logical[5]);
 void moveToXYZ(float x, float y, float z, float ry_deg, bool fixed_ry);  // solve + smooth move
+bool solveRecordedWaypoint(const Pose& pose, int out_logical[5], int* used_ry);
+
+// ── 6-DOF Inverse Kinematics ───────────────────────────────────────────────
+// Full position + orientation IK for all 5 arm joints (gripper excluded).
+// Given a target (x,y,z) in mm and tool orientation (rx,ry) in degrees
+// (operator-frame RPY), solves for all 5 joint logical angles.
+// rz is NOT a free parameter — it's determined by base angle from (x,y).
+// Returns false if target is unreachable or any joint exceeds limits.
+bool solveIK6DOF(float x, float y, float z, float rx_deg, float ry_deg, int out_logical[5]);
+void ikJogDelta(float dx, float dy, float dz, float dry, float drx);   // relative IK move from current FK
+
+// IK control mode — when true, joystick/web controls move end-effector in
+// world coordinates via IK instead of jogging individual joints.
+extern bool ikControlMode;
+extern bool ikJogActive;    // true while an IK jog is in flight (for broadcast coalescing)

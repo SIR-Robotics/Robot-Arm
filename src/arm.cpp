@@ -30,6 +30,7 @@ constexpr float Z_W_ROLL   =  90.0f;
 // (sin/cos chain) stays geometrically correct.
 constexpr float Z_OUT_OFFSET  = 150.0f;   // mm — subtracted from FK z
 constexpr float RY_OUT_OFFSET =  49.0f;   // deg — subtracted from FK ry
+constexpr float IK_COS_EPS    =   0.02f;  // tolerance for integer-rounded FK waypoints
 
 // ── Joint table ─────────────────────────────────────────────────────────────
 // minUs/maxUs are physical pulse-width calibration; counts derived per-tick.
@@ -58,13 +59,23 @@ uint32_t playNextMs = 0;
 
 Pose* playSrc    = nullptr;
 int   playSrcLen = 0;
+static bool playSrcIsFk = false;
 
 Preset presets[MAX_PRESETS] = {
     { "Home",  1, { { { 129, 62, 86, 86, 86,  0 }, "" } } },
     { "Ready", 1, { { {  90, 60, 90, 90, 90, 45 }, "" } } },
     { "Pick",  1, { { {  90, 45, 45, 90, 90,  0 }, "" } } },
     { "Place", 1, { { {  90, 45, 45, 90, 90, 90 }, "" } } },
+    { "Red",   0, { } },
+    { "Yellow", 0, { } },
+    { "Blue",  0, { } },
 };
+
+static bool clampIkCosine(float& c) {
+    if (c < -1.0f - IK_COS_EPS || c > 1.0f + IK_COS_EPS) return false;
+    c = constrain(c, -1.0f, 1.0f);
+    return true;
+}
 
 // ── Servo math ──────────────────────────────────────────────────────────────
 uint16_t toCounts(const Joint& j, int angle) {
@@ -296,18 +307,13 @@ void processMotion() {
     if (moved) pendingBroadcast = true;
 }
 
-// ── Forward kinematics ──────────────────────────────────────────────────────
-// Planar 4-link chain (shoulder/elbow/wrist-pitch + wrist offset) in the arm's
-// vertical plane, then rotated about Z by the base angle. Each pitch joint
-// is measured from +Z, so total tool tilt = θ2 + θ3 + θ4. Wrist roll is on
-// the tool axis — it changes orientation but not the wrist-center position.
-Pose3D computeFK() {
+static Pose3D computeFKAt(const float a[5]) {
     const float D2R = (float)M_PI / 180.0f;
-    float t1 = (servoCur[0] - Z_BASE)     * D2R;
-    float t2 = (servoCur[1] - Z_SHOULDER) * D2R;
-    float t3 = (servoCur[2] - Z_ELBOW)    * D2R;
-    float t4 = (servoCur[3] - Z_W_PITCH)  * D2R;
-    float t5 = (servoCur[4] - Z_W_ROLL)   * D2R;
+    float t1 = (a[0] - Z_BASE)     * D2R;
+    float t2 = (a[1] - Z_SHOULDER) * D2R;
+    float t3 = (a[2] - Z_ELBOW)    * D2R;
+    float t4 = (a[3] - Z_W_PITCH)  * D2R;
+    float t5 = (a[4] - Z_W_ROLL)   * D2R;
 
     float a23  = t2 + t3;
     float a234 = a23 + t4;
@@ -322,6 +328,15 @@ Pose3D computeFK() {
     p.ry = (a234 / D2R) - RY_OUT_OFFSET;  // shifted: operator reference → Ry=0
     p.rz = t1 / D2R;                  // base yaw from +X
     return p;
+}
+
+// ── Forward kinematics ──────────────────────────────────────────────────────
+// Planar 4-link chain (shoulder/elbow/wrist-pitch + wrist offset) in the arm's
+// vertical plane, then rotated about Z by the base angle. Each pitch joint
+// is measured from +Z, so total tool tilt = θ2 + θ3 + θ4. Wrist roll is on
+// the tool axis — it changes orientation but not the wrist-center position.
+Pose3D computeFK() {
+    return computeFKAt(servoCur);
 }
 
 void printFK() {
@@ -367,7 +382,7 @@ bool solveIK(float x, float y, float z, float ry_deg, bool fixed_ry, int out_log
         float z2 = zi - L4 * cosf(ryi_rad);
         float d2    = r2*r2 + z2*z2;
         float cosT3 = (d2 - L2*L2 - L3*L3) / (2.0f * L2 * L3);
-        if (cosT3 < -1.0f || cosT3 > 1.0f) return false;
+        if (!clampIkCosine(cosT3)) return false;
         t3 = acosf(cosT3);                              // elbow-up
         float A = L2 + L3 * cosf(t3);
         float B = L3 * sinf(t3);
@@ -381,7 +396,7 @@ bool solveIK(float x, float y, float z, float ry_deg, bool fixed_ry, int out_log
         float Le    = L3 + L4;
         float d2    = r*r + zi*zi;
         float cosT3 = (d2 - L2*L2 - Le*Le) / (2.0f * L2 * Le);
-        if (cosT3 < -1.0f || cosT3 > 1.0f) return false;
+        if (!clampIkCosine(cosT3)) return false;
         t3 = acosf(cosT3);                              // elbow-up
         float A = L2 + Le * cosf(t3);
         float B = Le * sinf(t3);
@@ -401,6 +416,131 @@ bool solveIK(float x, float y, float z, float ry_deg, bool fixed_ry, int out_log
         }
     }
     return true;
+}
+
+// ── 6-DOF Inverse Kinematics (full position + orientation) ──────────────────
+// Solves all 5 arm joints (base/shoulder/elbow/wrist-pitch/wrist-roll) from
+// a target (x,y,z) and tool orientation (rx=roll, ry=pitch, both degrees).
+// rz is NOT an input — the base angle is determined by atan2(x,y).
+//
+// Algorithm (analytical, closed-form):
+//   1. Base yaw t1 = atan2(x, y) — arm is a planar chain rotated about Z.
+//   2. Tool orientation constrains total pitch a234 = t2+t3+t4 = ry.
+//   3. Wrist roll t5 = rx (direct, on tool axis).
+//   4. Step back L4 along the tool axis → wrist-pitch joint center (r2,z2).
+//   5. Standard 2-link IK (cosine rule) on L2-L3 with elbow-up (acos positive).
+//   6. Back-solve t4 from the orientation constraint: t4 = a234 - t2 - t3.
+//   7. Convert kinematic angles → logical servo degrees via zero-offset table.
+//   8. Clamp each joint to [lo, hi]; return false if any hit.
+//
+// Reference: Peter Corke, "Robotics, Vision and Control" §7.3 — planar arm IK.
+bool solveIK6DOF(float x, float y, float z, float rx_deg, float ry_deg,
+                 int out_logical[5]) {
+    const float D2R = (float)M_PI / 180.0f;
+
+    float zi = z + Z_OUT_OFFSET;
+    float t1 = atan2f(x, y);
+    float rad = sqrtf(x*x + y*y);
+
+    float a234 = (ry_deg + RY_OUT_OFFSET) * D2R;
+    float t5   =  rx_deg * D2R;
+
+    float r2 = rad - L4 * sinf(a234);
+    float z2 = zi  - L4 * cosf(a234);
+
+    float d2    = r2*r2 + z2*z2;
+    float cosT3 = (d2 - L2*L2 - L3*L3) / (2.0f * L2 * L3);
+    if (!clampIkCosine(cosT3)) return false;
+
+    float t3_options[2] = { acosf(cosT3), -acosf(cosT3) };
+
+    float bestErr       = 1e9f;
+    float bestJointCost = 1e9f;
+    bool  found   = false;
+    int   bestJ[5];
+
+    for (int bc = 0; bc < 4; bc++) {
+        float tb = t1 + bc * (float)M_PI;
+        int baseL = (int)lroundf(tb / D2R + Z_BASE);
+        if (baseL < joints[0].lo || baseL > joints[0].hi) continue;
+
+        for (int branch = 0; branch < 2; branch++) {
+            float t3 = t3_options[branch];
+            float A  = L2 + L3 * cosf(t3);
+            float B  = L3 * sinf(t3);
+            float t2 = atan2f(A*r2 - B*z2, B*r2 + A*z2);
+            float t4 = a234 - t2 - t3;
+
+            int cand[5];
+            cand[0] = baseL;
+            cand[1] = (int)lroundf(t2 / D2R + Z_SHOULDER);
+            cand[2] = (int)lroundf(t3 / D2R + Z_ELBOW);
+            cand[3] = (int)lroundf(t4 / D2R + Z_W_PITCH);
+            cand[4] = (int)lroundf(t5 / D2R + Z_W_ROLL);
+
+            bool valid = true;
+            for (int i = 1; i < 5; i++) {
+                if (cand[i] < joints[i].lo || cand[i] > joints[i].hi) {
+                    valid = false; break;
+                }
+            }
+            if (!valid) continue;
+
+            // Evaluate FK position error, then prefer the branch nearest the
+            // current target so IK jogs do not flip between equivalent poses.
+            float  ca[5] = {(float)cand[0],(float)cand[1],(float)cand[2],
+                             (float)cand[3],(float)cand[4]};
+            Pose3D fk = computeFKAt(ca);
+            float cxErr = fk.x - x, cyErr = fk.y - y, czErr = fk.z - z;
+            float err = cxErr*cxErr + cyErr*cyErr + czErr*czErr;
+            float jointCost = 0.0f;
+            for (int i = 0; i < 5; i++) {
+                float d = cand[i] - servoTarget[i];
+                jointCost += d * d;
+            }
+
+            if (err < bestErr - 1.0f ||
+                (fabsf(err - bestErr) <= 1.0f && jointCost < bestJointCost)) {
+                bestErr = err;
+                bestJointCost = jointCost;
+                for (int i = 0; i < 5; i++) bestJ[i] = cand[i];
+                found = true;
+            }
+        }
+    }
+    if (!found) return false;
+    // Reject solutions with large position error (incremential jog near origin
+    // can produce wrong-quadrant solutions when FK had r<0).
+    if (bestErr > 100.0f) return false;               // >10 mm² error → treat as unreachable
+    for (int i = 0; i < 5; i++) out_logical[i] = bestJ[i];
+    return true;
+}
+
+// IK control mode — toggled via serial/web. When active, joystick and web
+// controls move the end-effector in world coordinates instead of jogging
+// individual joints. Gripper (joint 5) stays in direct mode always.
+bool ikControlMode = false;
+bool ikJogActive   = false;
+
+// Relative IK jog: compute current FK, add world-frame delta, re-solve.
+// Silently ignores unreachable targets so the user can push out and back
+// without hitting an error on every out-of-workspace tick.
+void ikJogDelta(float dx, float dy, float dz, float dry, float drx) {
+    float targetPose[5] = { servoTarget[0], servoTarget[1], servoTarget[2],
+                            servoTarget[3], servoTarget[4] };
+    Pose3D cur = computeFKAt(targetPose);
+    float tx = cur.x + dx;
+    float ty = cur.y + dy;
+    float tz = cur.z + dz;
+    float trx = cur.rx + drx;
+    float try_deg = cur.ry + dry;
+
+    int s[5];
+    if (!solveIK6DOF(tx, ty, tz, trx, try_deg, s)) return;
+
+    for (int i = 0; i < 5; i++) setServo(i, s[i]);
+    ikJogActive = true;
+    pendingBroadcast = true;
 }
 
 void moveToXYZ(float x, float y, float z, float ry_deg, bool fixed_ry) {
@@ -427,12 +567,51 @@ void moveToXYZ(float x, float y, float z, float ry_deg, bool fixed_ry) {
 }
 
 // ── Recording ───────────────────────────────────────────────────────────────
+bool solveRecordedWaypoint(const Pose& pose, int out[5], int* usedRy) {
+    const int* a = pose.a; // X,Y,Z,Ry,Rx,Gripper
+    if (usedRy) *usedRy = a[3];
+
+    if (solveIK6DOF((float)a[0], (float)a[1], (float)a[2],
+                    (float)a[4], (float)a[3], out)) {
+        return true;
+    }
+
+    for (int d = 1; d <= 15; d++) {
+        for (int sign = -1; sign <= 1; sign += 2) {
+            int ry = a[3] + sign * d;
+            if (solveIK6DOF((float)a[0], (float)a[1], (float)a[2],
+                            (float)a[4], (float)ry, out)) {
+                if (usedRy) *usedRy = ry;
+                return true;
+            }
+        }
+    }
+
+    if (solveIK((float)a[0], (float)a[1], (float)a[2], 0.0f,
+                /*fixed_ry=*/false, out)) {
+        out[4] = constrain(a[4] + (int)lroundf(Z_W_ROLL), joints[4].lo, joints[4].hi);
+        if (usedRy) *usedRy = 999;
+        return true;
+    }
+
+    return false;
+}
+
 void recordPose() {
     if (seqLen >= MAX_POSES) { Serial.println("[REC] Full"); return; }
-    for (int i = 0; i < 6; i++) seq[seqLen].a[i] = joints[i].cur;
+    Pose3D fk = computeFK();
+    seq[seqLen].a[0] = (int)lroundf(fk.x);
+    seq[seqLen].a[1] = (int)lroundf(fk.y);
+    seq[seqLen].a[2] = (int)lroundf(fk.z);
+    seq[seqLen].a[3] = (int)lroundf(fk.ry);
+    seq[seqLen].a[4] = (int)lroundf(fk.rx);
+    seq[seqLen].a[5] = joints[5].cur;
     snprintf(seq[seqLen].label, sizeof(seq[seqLen].label), "Pose %d", seqLen + 1);
     seqLen++;
-    Serial.printf("[REC] %d total\n", seqLen);
+    Serial.printf("[REC] %d total  FK=(%d,%d,%d Ry=%d Rx=%d G=%d)\n",
+                  seqLen,
+                  seq[seqLen - 1].a[0], seq[seqLen - 1].a[1], seq[seqLen - 1].a[2],
+                  seq[seqLen - 1].a[3], seq[seqLen - 1].a[4], seq[seqLen - 1].a[5]);
     pendingBroadcast = true;
 }
 
@@ -445,6 +624,7 @@ void renamePose(int idx, const char* name) {
 void startPlayback() {
     if (!seqLen) { Serial.println("[PLAY] Empty"); return; }
     playSrc = seq; playSrcLen = seqLen;
+    playSrcIsFk = true;
     isCycling = false; isPlaying = true;
     playIdx = 0; playNextMs = millis();
     pendingBroadcast = true;
@@ -455,6 +635,7 @@ void stopPlayback() { isPlaying = false; isCycling = false; pendingBroadcast = t
 void startCycle() {
     if (!seqLen) { Serial.println("[CYCLE] Empty"); return; }
     playSrc = seq; playSrcLen = seqLen;
+    playSrcIsFk = true;
     isPlaying = false; isCycling = true;
     playIdx = 0; playNextMs = millis();
     pendingBroadcast = true;
@@ -519,6 +700,7 @@ void playPreset(uint8_t idx) {
         // Multi-pose preset → playback through motion engine
         playSrc = presets[idx].seq;
         playSrcLen = presets[idx].len;
+        playSrcIsFk = true;
         isCycling = false; isPlaying = true;
         playIdx = 0; playNextMs = millis();
         pendingBroadcast = true;
@@ -526,6 +708,10 @@ void playPreset(uint8_t idx) {
                       (unsigned)idx, presets[idx].name, presets[idx].len);
     }
 }
+
+void runRed()    { playPreset(PRESET_RED); }
+void runYellow() { playPreset(PRESET_YELLOW); }
+void runBlue()   { playPreset(PRESET_BLUE); }
 
 void savePresetsToFlash() {
     prefs.begin("roboarm", false);
@@ -595,7 +781,34 @@ void processPlayback() {
         }
     }
 
-    for (int i = 0; i < 6; i++) setServo(i, playSrc[playIdx].a[i]);   // smooth ramp
+    if (playSrcIsFk) {
+        int s[5];
+        int usedRy = 0;
+        int* a = playSrc[playIdx].a;
+        if (!solveRecordedWaypoint(playSrc[playIdx], s, &usedRy)) {
+            Serial.printf("[%s] %d/%d \"%s\" unreachable FK=(%d,%d,%d Ry=%d Rx=%d)\n",
+                isCycling ? "CYC" : "PLAY", playIdx + 1, playSrcLen, playSrc[playIdx].label,
+                a[0], a[1], a[2], a[3], a[4]);
+            playIdx++;
+            playNextMs = millis() + PLAY_STEP_MS;
+            pendingBroadcast = true;
+            return;
+        }
+        if (usedRy != a[3]) {
+            if (usedRy == 999) {
+                Serial.printf("[%s] %d/%d \"%s\" using position-only IK\n",
+                    isCycling ? "CYC" : "PLAY", playIdx + 1, playSrcLen, playSrc[playIdx].label);
+            } else {
+                Serial.printf("[%s] %d/%d \"%s\" relaxed Ry %d -> %d\n",
+                    isCycling ? "CYC" : "PLAY", playIdx + 1, playSrcLen, playSrc[playIdx].label,
+                    a[3], usedRy);
+            }
+        }
+        for (int i = 0; i < 5; i++) setServo(i, s[i]);
+        setServo(5, a[5]);
+    } else {
+        for (int i = 0; i < 6; i++) setServo(i, playSrc[playIdx].a[i]);   // smooth ramp
+    }
     Serial.printf("[%s] %d/%d \"%s\"\n",
         isCycling ? "CYC" : "PLAY", playIdx + 1, playSrcLen, playSrc[playIdx].label);
     playIdx++;
