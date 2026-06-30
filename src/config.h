@@ -61,8 +61,18 @@ struct Joint {
 
 struct Pose { int a[6]; char label[20]; };
 
-#define MAX_PRESETS          4
+#define MAX_PRESETS          7
 #define MAX_POSES_PER_PRESET 30
+
+enum PresetSlot : uint8_t {
+    PRESET_HOME = 0,
+    PRESET_READY,
+    PRESET_PICK,
+    PRESET_PLACE,
+    PRESET_RED,
+    PRESET_YELLOW,
+    PRESET_BLUE,
+};
 
 struct Preset {
     char name[20];

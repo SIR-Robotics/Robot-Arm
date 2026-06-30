@@ -294,13 +294,30 @@ int importPosesFromJson(const char* buf, size_t len) {
     return newLen;
 }
 
-// ── HTTP routes: download/upload poses as JSON ──────────────────────────────
+// ── HTTP routes: download/upload poses as JSON, run color presets ───────────
 // GET  /poses.json — current sequence, downloaded as poses.json
 // POST /poses.json — body is JSON, replaces sequence and persists to flash
+// GET/POST /api/run/red|yellow|blue — execute recorded color preset sequence
 static char    importBuf[3200];
 static size_t  importLen = 0;
 
 void registerHttpRoutes(AsyncWebServer& srv) {
+    auto addRunRoute = [&](const char* path, const char* name, uint8_t idx, void (*fn)()) {
+        auto handler = [name, idx, fn](AsyncWebServerRequest* req) {
+            fn();
+            char resp[80];
+            snprintf(resp, sizeof(resp), "{\"ok\":true,\"preset\":\"%s\",\"len\":%d}",
+                     name, presets[idx].len);
+            req->send(200, "application/json", resp);
+        };
+        srv.on(path, HTTP_GET, handler);
+        srv.on(path, HTTP_POST, handler);
+    };
+
+    addRunRoute("/api/run/red",    "red",    PRESET_RED,    runRed);
+    addRunRoute("/api/run/yellow", "yellow", PRESET_YELLOW, runYellow);
+    addRunRoute("/api/run/blue",   "blue",   PRESET_BLUE,   runBlue);
+
     srv.on("/poses.json", HTTP_GET, [](AsyncWebServerRequest* req){
         AsyncWebServerResponse* r = req->beginResponse(200, "application/json", buildPoses());
         r->addHeader("Content-Disposition", "attachment; filename=poses.json");
@@ -353,7 +370,7 @@ static const char* BOOT_NAMES[] = { "INIT", "HOMING", "IDLE", "BUSY", "FAULT" };
 static void printHelp() {
     Serial.println();
     Serial.println(F("─── RoboArm serial — quick commands ───────────────────"));
-    Serial.println(F("  0 1 2 3  play preset (0=Home 1=Ready 2=Pick 3=Place)"));
+    Serial.println(F("  0..6     play preset (4=Red 5=Yellow 6=Blue)"));
     Serial.println(F("  H        home (= preset 0)"));
     Serial.println(F("  R        record current pose"));
     Serial.println(F("  P        play / S stop / C cycle toggle"));
@@ -362,8 +379,9 @@ static void printHelp() {
     Serial.println(F("  ?        this help"));
     Serial.println(F("─── Long form ─────────────────────────────────────────"));
     Serial.println(F("  STATUS              FSM state + joints + WiFi"));
-    Serial.println(F("  PRESET <0-3>        same as the digit shortcut"));
-    Serial.println(F("  RENAME <0-3> <nm>   rename a preset (UPPERCASE)"));
+    Serial.println(F("  PRESET <0-6>        same as the digit shortcut"));
+    Serial.println(F("  RED/YELLOW/BLUE     run the matching color preset"));
+    Serial.println(F("  RENAME <0-6> <nm>   rename a preset (UPPERCASE)"));
     Serial.println(F("  S <j> <a>           set joint j to angle a (smooth)"));
     Serial.println(F("  MOVE                show current XYZ + Rxyz"));
     Serial.println(F("  MOVE x y z          IK move (free Ry — wider reach)"));
@@ -399,6 +417,7 @@ void processSerial() {
             case 'V': saveToFlash();                                     return;
             case 'L': loadFromFlash();                                   return;
             case '0': case '1': case '2': case '3':
+            case '4': case '5': case '6':
                 playPreset((uint8_t)(c - '0'));                          return;
         }
         // Single letter that didn't match — fall through to unknown handler
@@ -467,7 +486,7 @@ void processSerial() {
         } else {
             int idx = cmd.substring(7).toInt();
             if (idx >= 0 && idx < MAX_PRESETS) playPreset((uint8_t)idx);
-            else Serial.println("Preset 0-3");
+            else Serial.println("Preset 0-6");
         }
     }
     else if (cmd.startsWith("RENAME")) {
@@ -475,7 +494,7 @@ void processSerial() {
         int s1 = cmd.indexOf(' ');
         int s2 = cmd.indexOf(' ', s1 + 1);
         if (s1 < 0 || s2 < 0) {
-            Serial.println("Usage: RENAME <0-3> <name>  (uppercase only via serial)");
+            Serial.println("Usage: RENAME <0-6> <name>  (uppercase only via serial)");
         } else {
             int idx = cmd.substring(s1 + 1, s2).toInt();
             String nm = cmd.substring(s2 + 1);
@@ -484,7 +503,7 @@ void processSerial() {
                 char buf[20]; nm.toCharArray(buf, sizeof(buf));
                 renamePreset((uint8_t)idx, buf);
             } else {
-                Serial.println("Preset 0-3");
+                Serial.println("Preset 0-6");
             }
         }
     }
@@ -593,6 +612,9 @@ void processSerial() {
         }
     }
     else if (cmd == "HELP") printHelp();
+    else if (cmd == "RED")    runRed();
+    else if (cmd == "YELLOW") runYellow();
+    else if (cmd == "BLUE")   runBlue();
     // ── Long-form aliases for the legacy verbs (REC/PLAY/STOP/...) ─────────
     else if (cmd == "REC")    recordPose();
     else if (cmd == "PLAY")   startPlayback();

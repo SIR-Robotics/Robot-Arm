@@ -66,6 +66,9 @@ Preset presets[MAX_PRESETS] = {
     { "Ready", 1, { { {  90, 60, 90, 90, 90, 45 }, "" } } },
     { "Pick",  1, { { {  90, 45, 45, 90, 90,  0 }, "" } } },
     { "Place", 1, { { {  90, 45, 45, 90, 90, 90 }, "" } } },
+    { "Red",   0, { } },
+    { "Yellow", 0, { } },
+    { "Blue",  0, { } },
 };
 
 static bool clampIkCosine(float& c) {
@@ -705,6 +708,10 @@ void playPreset(uint8_t idx) {
                       (unsigned)idx, presets[idx].name, presets[idx].len);
     }
 }
+
+void runRed()    { playPreset(PRESET_RED); }
+void runYellow() { playPreset(PRESET_YELLOW); }
+void runBlue()   { playPreset(PRESET_BLUE); }
 
 void savePresetsToFlash() {
     prefs.begin("roboarm", false);

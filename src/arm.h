@@ -44,6 +44,9 @@ void setPresetFromCurrent(uint8_t idx);       // 0=home 1=ready 2=pick 3=place
 void renamePreset(uint8_t idx, const char* name);  // writes through to flash
 void savePresetsToFlash();
 void loadPresetsFromFlash();
+void runRed();
+void runYellow();
+void runBlue();
 
 // ── Recording / playback
 void recordPose();
