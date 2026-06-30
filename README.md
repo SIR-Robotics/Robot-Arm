@@ -60,8 +60,29 @@ A single-page app served from the ESP32 over HTTP. It connects back to the ESP32
 
 - **Touch joystick** — on-screen jog pad controlling one joint pair at a time
 - **Joint mode selector** — switch between Base+Shoulder / Elbow+Wrist Pitch / Wrist Roll+Gripper
-- **Preset buttons** — Home, Ready, Pick, Place
+- **Preset buttons** — Home, Ready, Pick, Place, Red, Yellow, Blue
 - **Pose recorder** — Record, Play, Cycle, Clear, Save, Load, per-pose rename
+
+### HTTP API
+
+Use the ESP32 IP printed on serial as the host.
+
+| Method | Path | Action | Response |
+|--------|------|--------|----------|
+| `GET` | `/` | Serve the web UI | HTML |
+| `GET` | `/poses.json` | Download the live recorded sequence | `{"t":"p","c":...,"i":[...]}` |
+| `POST` | `/poses.json` | Replace the live recorded sequence from JSON and save it | `{"ok":true,"n":<count>}` |
+| `GET`/`POST` | `/api/run/red` | Run preset slot `4` (`Red`) | `{"ok":true,"preset":"red","len":<poses>}` |
+| `GET`/`POST` | `/api/run/yellow` | Run preset slot `5` (`Yellow`) | `{"ok":true,"preset":"yellow","len":<poses>}` |
+| `GET`/`POST` | `/api/run/blue` | Run preset slot `6` (`Blue`) | `{"ok":true,"preset":"blue","len":<poses>}` |
+
+Example:
+
+```bash
+curl -X POST http://ROBOT_IP/api/run/red
+```
+
+The color routes call `runRed()`, `runYellow()`, and `runBlue()`. Record a movement in the UI, then save the recording into preset `4`, `5`, or `6`; the API runs whatever sequence is stored there.
 
 ### WebSocket protocol
 
@@ -70,8 +91,12 @@ Inbound messages use a zero-allocation `TAG:arg:arg` text format (no JSON parsin
 | Tag | Args | Action |
 |-----|------|--------|
 | `JG` | joint, value (−100..100) | Jog joint continuously |
+| `JX` | joint1, value1, joint2, value2 | Jog two joints from one stick frame |
 | `SV` | joint, angle | Set servo to absolute angle |
-| `PR` | name | Apply preset (`home`/`ready`/`pick`/`place`) |
+| `PR` | index | Play preset `0..6` (`4=Red`, `5=Yellow`, `6=Blue`) |
+| `SP` | index | Save current joint pose into preset |
+| `SQ` | index | Save current recording sequence into preset |
+| `PN` | index, name | Rename preset |
 | `MD` | mode (0–2) | Set joystick pair mode |
 | `RC` | — | Record current pose |
 | `RN` | index, name | Rename pose |
@@ -82,8 +107,11 @@ Inbound messages use a zero-allocation `TAG:arg:arg` text format (no JSON parsin
 | `CL` | — | Clear all poses |
 | `SA` | — | Save poses to flash |
 | `LD` | — | Load poses from flash |
+| `MV` | x, y, z[, ry] | IK move, optionally fixed pitch |
+| `ID` | dx, dy, dz, dry, drx | IK jog input (−100..100 per axis) |
+| `IK` | 0 or 1 | Toggle IK control mode |
 
-Outbound JSON uses two message types: `{"t":"s",...}` for status (joint angles, mode, playback state) and `{"t":"p",...}` for the full pose list. Both are built with `snprintf` into static buffers — no heap allocation on the hot path.
+Outbound JSON uses three message types: `{"t":"s",...}` for status, `{"t":"p",...}` for the live pose list, and `{"t":"pl",...}` for preset names/lengths. They are built with `snprintf` into static buffers — no heap allocation on the hot path.
 
 ---
 
@@ -125,7 +153,9 @@ Connect with `pio run -t monitor`. Send `HELP` for the full menu.
 | `STATUS` | Dump joint table, angles, joystick mode, recording state |
 | `S <joint> <angle>` | Direct servo write |
 | `INVERT <0-5>` | Toggle a joint's invert flag at runtime |
-| `HOME` | Move all joints to home position |
+| `PRESET <0-6>` | Run preset, including `4=Red`, `5=Yellow`, `6=Blue` |
+| `RED` / `YELLOW` / `BLUE` | Run the matching color preset |
+| `H` | Run the Home preset |
 
 `INVERT` is useful when wiring a servo in reverse — toggle until motion direction is correct, then update the `joints[]` table and reflash.
 

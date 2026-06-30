@@ -482,7 +482,7 @@ void processSerial() {
     }
     else if (cmd.startsWith("PRESET")) {
         if (cmd.length() <= 6) {
-            Serial.println("Usage: PRESET <0-3>");
+            Serial.println("Usage: PRESET <0-6>");
         } else {
             int idx = cmd.substring(7).toInt();
             if (idx >= 0 && idx < MAX_PRESETS) playPreset((uint8_t)idx);
