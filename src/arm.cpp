@@ -304,18 +304,13 @@ void processMotion() {
     if (moved) pendingBroadcast = true;
 }
 
-// ── Forward kinematics ──────────────────────────────────────────────────────
-// Planar 4-link chain (shoulder/elbow/wrist-pitch + wrist offset) in the arm's
-// vertical plane, then rotated about Z by the base angle. Each pitch joint
-// is measured from +Z, so total tool tilt = θ2 + θ3 + θ4. Wrist roll is on
-// the tool axis — it changes orientation but not the wrist-center position.
-Pose3D computeFK() {
+static Pose3D computeFKAt(const float a[5]) {
     const float D2R = (float)M_PI / 180.0f;
-    float t1 = (servoCur[0] - Z_BASE)     * D2R;
-    float t2 = (servoCur[1] - Z_SHOULDER) * D2R;
-    float t3 = (servoCur[2] - Z_ELBOW)    * D2R;
-    float t4 = (servoCur[3] - Z_W_PITCH)  * D2R;
-    float t5 = (servoCur[4] - Z_W_ROLL)   * D2R;
+    float t1 = (a[0] - Z_BASE)     * D2R;
+    float t2 = (a[1] - Z_SHOULDER) * D2R;
+    float t3 = (a[2] - Z_ELBOW)    * D2R;
+    float t4 = (a[3] - Z_W_PITCH)  * D2R;
+    float t5 = (a[4] - Z_W_ROLL)   * D2R;
 
     float a23  = t2 + t3;
     float a234 = a23 + t4;
@@ -330,6 +325,15 @@ Pose3D computeFK() {
     p.ry = (a234 / D2R) - RY_OUT_OFFSET;  // shifted: operator reference → Ry=0
     p.rz = t1 / D2R;                  // base yaw from +X
     return p;
+}
+
+// ── Forward kinematics ──────────────────────────────────────────────────────
+// Planar 4-link chain (shoulder/elbow/wrist-pitch + wrist offset) in the arm's
+// vertical plane, then rotated about Z by the base angle. Each pitch joint
+// is measured from +Z, so total tool tilt = θ2 + θ3 + θ4. Wrist roll is on
+// the tool axis — it changes orientation but not the wrist-center position.
+Pose3D computeFK() {
+    return computeFKAt(servoCur);
 }
 
 void printFK() {
@@ -447,7 +451,8 @@ bool solveIK6DOF(float x, float y, float z, float rx_deg, float ry_deg,
 
     float t3_options[2] = { acosf(cosT3), -acosf(cosT3) };
 
-    float bestErr = 1e9f;
+    float bestErr       = 1e9f;
+    float bestJointCost = 1e9f;
     bool  found   = false;
     int   bestJ[5];
 
@@ -478,22 +483,23 @@ bool solveIK6DOF(float x, float y, float z, float rx_deg, float ry_deg,
             }
             if (!valid) continue;
 
-            // Evaluate FK position error for this candidate
+            // Evaluate FK position error, then prefer the branch nearest the
+            // current target so IK jogs do not flip between equivalent poses.
             float  ca[5] = {(float)cand[0],(float)cand[1],(float)cand[2],
                              (float)cand[3],(float)cand[4]};
-            float ct1 = (ca[0] - Z_BASE)     * D2R;
-            float ct2 = (ca[1] - Z_SHOULDER) * D2R;
-            float ct3 = (ca[2] - Z_ELBOW)    * D2R;
-            float ct4 = (ca[3] - Z_W_PITCH)  * D2R;
-            float ca23 = ct2 + ct3, ca234 = ca23 + ct4;
-            float cr = L2*sinf(ct2) + L3*sinf(ca23) + L4*sinf(ca234);
-            float cz = L2*cosf(ct2) + L3*cosf(ca23) + L4*cosf(ca234);
-            float cx = cr * sinf(ct1), cy = cr * cosf(ct1);
-            float cxErr = cx - x, cyErr = cy - y, czErr = (cz - Z_OUT_OFFSET) - z;
+            Pose3D fk = computeFKAt(ca);
+            float cxErr = fk.x - x, cyErr = fk.y - y, czErr = fk.z - z;
             float err = cxErr*cxErr + cyErr*cyErr + czErr*czErr;
+            float jointCost = 0.0f;
+            for (int i = 0; i < 5; i++) {
+                float d = cand[i] - servoTarget[i];
+                jointCost += d * d;
+            }
 
-            if (err < bestErr) {
+            if (err < bestErr - 1.0f ||
+                (fabsf(err - bestErr) <= 1.0f && jointCost < bestJointCost)) {
                 bestErr = err;
+                bestJointCost = jointCost;
                 for (int i = 0; i < 5; i++) bestJ[i] = cand[i];
                 found = true;
             }
@@ -517,7 +523,9 @@ bool ikJogActive   = false;
 // Silently ignores unreachable targets so the user can push out and back
 // without hitting an error on every out-of-workspace tick.
 void ikJogDelta(float dx, float dy, float dz, float dry, float drx) {
-    Pose3D cur = computeFK();
+    float targetPose[5] = { servoTarget[0], servoTarget[1], servoTarget[2],
+                            servoTarget[3], servoTarget[4] };
+    Pose3D cur = computeFKAt(targetPose);
     float tx = cur.x + dx;
     float ty = cur.y + dy;
     float tz = cur.z + dz;
