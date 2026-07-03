@@ -21,6 +21,7 @@
 #include "input.h"
 #include "protocol.h"
 #include "web_ui.h"
+#include "favoriot_mqtt.h"
 
 // ─── WiFi (STA) ─────────────────────────────────────────────────────────────
 const char* WIFI_SSID = "ASEM Training";
@@ -120,6 +121,7 @@ void setup() {
     } else {
         Serial.println("[WiFi] FAILED");
     }
+    setupFavoriotMqtt();
 
     ws.onEvent(onWsEvent);
     server.addHandler(&ws);
@@ -159,6 +161,7 @@ void loop() {
         }
     }
     processSerial();
+    loopFavoriotMqtt();
 
     static uint32_t lastCleanupMs = 0;
     if (millis() - lastCleanupMs >= 1000) {
