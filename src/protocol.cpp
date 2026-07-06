@@ -17,7 +17,7 @@ const char* buildStatus() {
         "{\"t\":\"s\",\"j\":[%d,%d,%d,%d,%d,%d],"
         "\"m\":%u,\"l\":%d,\"p\":%d,\"c\":%d,\"i\":%d,\"r\":%d,\"b\":%u,"
         "\"x\":%ld,\"y\":%ld,\"z\":%ld,\"rx\":%ld,\"ry\":%ld,\"rz\":%ld,"
-        "\"ik\":%d}",
+        "\"ik\":%d,\"sp\":%d}",
         joints[0].cur, joints[1].cur, joints[2].cur,
         joints[3].cur, joints[4].cur, joints[5].cur,
         (unsigned)joyMode, seqLen,
@@ -26,7 +26,8 @@ const char* buildStatus() {
         (unsigned)bootState,
         lroundf(fk.x),  lroundf(fk.y),  lroundf(fk.z),
         lroundf(fk.rx), lroundf(fk.ry), lroundf(fk.rz),
-        ikControlMode ? 1 : 0);
+        ikControlMode ? 1 : 0,
+        (int)lroundf(motionSpeed));
     return statusBuf;
 }
 
@@ -239,6 +240,14 @@ void processWsCmd(char* msg) {
             }
             break;
         }
+        case TAG('S','L'): {                             // SL:v  set motion speed (deg/sec)
+            if (!args[0]) break;
+            float v = atof(args[0]);
+            motionSpeed = constrain(v, 5.0f, 1000.0f);
+            Serial.printf("[MOTION] speed = %.1f deg/sec (via WS)\n", motionSpeed);
+            pendingBroadcast = true;
+            break;
+        }
     }
 }
 
@@ -304,6 +313,18 @@ static size_t  importLen = 0;
 void registerHttpRoutes(AsyncWebServer& srv) {
     auto addRunRoute = [&](const char* path, const char* name, uint8_t idx, void (*fn)()) {
         auto handler = [name, idx, fn](AsyncWebServerRequest* req) {
+            Serial.printf("[AMR] %s sequence triggered\n", name);
+            // Broadcast the notification frame into a fixed buffer and let
+            // the main loop's next status tick pick it up — avoids calling
+            // ws.textAll from the AsyncWebServer task directly.
+            if (ws.count() > 0) {
+                char note[96];
+                snprintf(note, sizeof(note),
+                    "{\"t\":\"n\",\"src\":\"amr\",\"color\":\"%s\","
+                    "\"msg\":\"AMR triggered %s sequence\"}",
+                    name, name);
+                ws.textAll(note);
+            }
             fn();
             char resp[80];
             snprintf(resp, sizeof(resp), "{\"ok\":true,\"preset\":\"%s\",\"len\":%d}",
@@ -317,6 +338,30 @@ void registerHttpRoutes(AsyncWebServer& srv) {
     addRunRoute("/api/run/red",    "red",    PRESET_RED,    runRed);
     addRunRoute("/api/run/yellow", "yellow", PRESET_YELLOW, runYellow);
     addRunRoute("/api/run/blue",   "blue",   PRESET_BLUE,   runBlue);
+
+    // ── Completion signal for the AMR ───────────────────────────────────────
+    // AMR polls this after POSTing /api/run/*; treats "busy":false as "arm
+    // finished, safe to drive off". Checks presetActive/isPlaying/isCycling
+    // in addition to bootState because bootState lags mutation flags by one
+    // main-loop tick — otherwise the AMR could see "idle" in the window
+    // between the run handler returning and the FSM catching up.
+    srv.on("/api/status", HTTP_GET, [](AsyncWebServerRequest* req) {
+        const char* stateName = "unknown";
+        switch (bootState) {
+            case STATE_INIT:   stateName = "init";   break;
+            case STATE_HOMING: stateName = "homing"; break;
+            case STATE_IDLE:   stateName = "idle";   break;
+            case STATE_BUSY:   stateName = "busy";   break;
+            case STATE_FAULT:  stateName = "fault";  break;
+        }
+        bool busy = (bootState != STATE_IDLE) ||
+                    isPlaying || isCycling || presetActive;
+        char resp[96];
+        snprintf(resp, sizeof(resp),
+            "{\"state\":\"%s\",\"busy\":%s,\"idx\":%d}",
+            stateName, busy ? "true" : "false", playIdx);
+        req->send(200, "application/json", resp);
+    });
 
     srv.on("/poses.json", HTTP_GET, [](AsyncWebServerRequest* req){
         AsyncWebServerResponse* r = req->beginResponse(200, "application/json", buildPoses());

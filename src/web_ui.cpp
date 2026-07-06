@@ -83,6 +83,19 @@ button.amb.on{background:linear-gradient(180deg,#e6a817,#c08810);color:#111;bord
 </div>
 <div class=p><h2>FK Position</h2><div id=fk style="font-family:Consolas,monospace;font-size:.82rem;color:var(--ac3);text-align:center;letter-spacing:.4px">--</div></div>
 <div class=p><h2>Fine Jog</h2><div id=fjp></div></div>
+<div class=p><h2>Motion Speed</h2>
+ <div style="display:flex;align-items:center;gap:10px">
+  <input id=spR type=range min=5 max=1000 step=5 value=120 style="flex:1;accent-color:var(--ac)">
+  <span id=spV style="font-family:Consolas,monospace;color:var(--ac3);min-width:76px;text-align:right;font-size:.85rem"><b>120</b> &deg;/s</span>
+ </div>
+ <div class=g4 style=margin-top:7px>
+  <button onclick="setSp(30)">Slow 30</button>
+  <button onclick="setSp(120)">Default 120</button>
+  <button onclick="setSp(300)">Fast 300</button>
+  <button onclick="setSp(600)">Rapid 600</button>
+ </div>
+ <div class=kbd>Ramp rate for smooth motion &mdash; applies to jog, presets, playback</div>
+</div>
 <div class=p><h2>IK Move</h2>
  <div style="display:grid;grid-template-columns:repeat(4,1fr) 70px;gap:6px;align-items:center;margin-bottom:7px">
   <input id=mvx type=number placeholder=X step=1 class=ri style="width:auto">
@@ -94,6 +107,15 @@ button.amb.on{background:linear-gradient(180deg,#e6a817,#c08810);color:#111;bord
  <div class=kbd>Ry empty = free wrist pitch (wider reach)</div>
 </div>
 <div class=p><h2>Presets</h2><div class=g4 id=psg></div><div class=kbd style=margin-top:7px>Tap card to run &mdash; tap name to rename &mdash; long-press to save current pose</div></div>
+<div class=p><h2>AMR Events <span class=bd id=amrCount>0</span></h2>
+ <div id=amrLog style="max-height:200px;overflow-y:auto;font-family:Consolas,monospace;font-size:.72rem;background:#0a1428;border-radius:6px;padding:4px">
+  <div style="color:var(--mu);padding:10px;text-align:center">Waiting for AMR triggers&hellip;</div>
+ </div>
+ <div class=g2 style=margin-top:7px>
+  <button onclick=clearAmrLog()>&#128465; Clear log</button>
+  <button onclick=testAmrLog()>&#128260; Test entry</button>
+ </div>
+</div>
 <div class=p><h2>Recording <span class=bd id=rc>0</span></h2>
  <div class=g4 style=margin-bottom:7px>
   <button class=grn onclick="w('RC');tt('Recorded')">&#9679; REC</button>
@@ -121,6 +143,7 @@ const JD=[{n:'BASE',k:'B',mn:0,mx:180,hm:90},{n:'SHOULDER',k:'S',mn:30,mx:150,hm
 const FKD=['X','Y','Z','Ry','Rx','G'];
 let ps=[],s,rT,lastA=[90,90,90,90,90,45],lastPlayIdx=-1,ikMode=false;
 let ikD=[0,0,0,0,0],likD=[0,0,0,0,0];  // IK deltas + last-sent for dedup
+let amrLog=[];   // ring buffer of recent AMR-triggered events (newest first)
 
 function toggleIK(){
  ikMode=!ikMode;
@@ -178,7 +201,7 @@ function cn(){
  s.onopen=()=>{sd(1);tt('Connected');clearTimeout(rT)};
  s.onclose=()=>{sd(0);tt('Disconnected');rT=setTimeout(cn,2500)};
  s.onerror=()=>s.close();
- s.onmessage=(e)=>{const d=JSON.parse(e.data);if(d.t==='s')aS(d);else if(d.t==='p')aP(d);else if(d.t==='pl')aL(d)};
+ s.onmessage=(e)=>{const d=JSON.parse(e.data);if(d.t==='s')aS(d);else if(d.t==='p')aP(d);else if(d.t==='pl')aL(d);else if(d.t==='n')aN(d)};
 }
 function w(x){if(s&&s.readyState===1)s.send(x)}
 function sd(o){const d=document.getElementById('dt');d.classList.toggle('ok',!!o);d.classList.toggle('err',!o)}
@@ -186,6 +209,40 @@ function sd(o){const d=document.getElementById('dt');d.classList.toggle('ok',!!o
 // ── Toast
 let tID=0;
 function tt(m){const e=document.getElementById('toast');e.textContent=m;e.classList.add('show');clearTimeout(tID);tID=setTimeout(()=>e.classList.remove('show'),1500)}
+
+// ── AMR-triggered sequence notification. Fires a toast AND appends to the
+// persistent event log so the operator can review triggers after the fact.
+const AMR_COL={red:'#e94560',yellow:'#e6a817',blue:'#4fc3f7'};
+function aN(d){
+ const e=document.getElementById('toast');
+ e.textContent='\u{1F916} '+(d.msg||'AMR event');
+ const c=AMR_COL[d.color]||'var(--ac)';
+ e.style.borderColor=c;e.style.boxShadow='0 4px 22px '+c;
+ e.classList.add('show');
+ clearTimeout(tID);
+ tID=setTimeout(()=>{e.classList.remove('show');e.style.borderColor='';e.style.boxShadow=''},4000);
+ const ts=new Date().toTimeString().substring(0,8);
+ amrLog.unshift({ts,color:d.color,msg:d.msg||'AMR event',src:d.src||'?'});
+ if(amrLog.length>30)amrLog.pop();
+ rAL();
+}
+function rAL(){
+ const e=document.getElementById('amrLog');
+ if(!e)return;
+ const cnt=document.getElementById('amrCount');
+ if(cnt)cnt.textContent=amrLog.length;
+ if(amrLog.length===0){
+  e.innerHTML='<div style="color:var(--mu);padding:10px;text-align:center">Waiting for AMR triggers&hellip;</div>';
+  return;
+ }
+ e.innerHTML=amrLog.map(x=>{
+  const c=AMR_COL[x.color]||'var(--ac3)';
+  const cn=(x.color||'?').toUpperCase();
+  return `<div style="display:flex;align-items:center;gap:8px;padding:5px 8px;margin-bottom:2px;background:var(--p2);border-left:3px solid ${c};border-radius:3px"><span style="color:var(--mu);min-width:62px">${x.ts}</span><span style="color:${c};font-weight:800;letter-spacing:1px;min-width:52px">${cn}</span><span style="color:var(--tx);flex:1">${eh(x.msg)}</span></div>`;
+ }).join('');
+}
+function clearAmrLog(){amrLog=[];rAL();}
+function testAmrLog(){aN({src:'test',color:'yellow',msg:'Test entry (local, not from AMR)'})}
 
 // ── Apply status / poses
 function aS(d){
@@ -215,6 +272,7 @@ if(d.c||d.p){
    if(d.i!==lastPlayIdx){lastPlayIdx=d.i;document.querySelectorAll('.pi').forEach((p,k)=>p.classList.toggle('cur',k===d.i-1))}
   } else if(lastPlayIdx!==-1){lastPlayIdx=-1;document.querySelectorAll('.pi').forEach(p=>p.classList.remove('cur'))}
   if(typeof d.ik==='number'&&!!d.ik!==ikMode){ikMode=!!d.ik;updateStickLabels()}
+  if(typeof d.sp==='number'&&!spDrag&&+spR.value!==d.sp){spR.value=d.sp;spV.innerHTML='<b>'+d.sp+'</b> &deg;/s'}
 }
 function aP(d){ps=d.i||[];document.getElementById('rc').textContent=d.c;rP()}
 function eh(x){return x.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/"/g,'&quot;')}
@@ -506,6 +564,15 @@ function mv(){
  if(rv){w('MV:'+x+':'+y+':'+z+':'+rv);tt('IK '+x+','+y+','+z+' Ry='+rv)}
  else{w('MV:'+x+':'+y+':'+z);tt('IK '+x+','+y+','+z+' free Ry')}
 }
+
+// ── Motion speed slider ──────────────────────────────────────────────────
+// Commit on release only (change), preview on drag (input) — avoids ~60 Hz
+// WS spam. spDrag guards aS() from yanking the knob mid-drag.
+const spR=document.getElementById('spR'),spV=document.getElementById('spV');
+let spDrag=false;
+spR.addEventListener('input',()=>{spDrag=true;spV.innerHTML='<b>'+spR.value+'</b> °/s'});
+spR.addEventListener('change',()=>{spDrag=false;w('SL:'+spR.value);tt('Speed '+spR.value+' °/s')});
+function setSp(v){spR.value=v;spV.innerHTML='<b>'+v+'</b> °/s';w('SL:'+v);tt('Speed '+v+' °/s')}
 
 cn();
 </script></body></html>)raw";

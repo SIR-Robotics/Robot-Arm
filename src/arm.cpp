@@ -2,6 +2,7 @@
 #include "arm.h"
 #include "globals.h"
 #include <math.h>
+#include <cstddef>
 
 // ── Link geometry (mm) — measured from the physical arm.
 // FK origin = shoulder pivot (NOT base servo plate). The 43 mm base column
@@ -47,7 +48,7 @@ Joint joints[6] = {
 // ── Smooth motion state
 float servoCur[6]    = {129, 62, 86, 86, 86, 0};
 float servoTarget[6] = {129, 62, 86, 86, 86, 0};
-float motionSpeed    = 40.0f;         // deg/sec — ~2.25s for a 90° move (matches preset speed)
+float motionSpeed    = 120.0f;        // deg/sec — ~0.75s for a 90° move; snappy trigger response
 
 // ── Recording state
 Pose     seq[MAX_POSES];
@@ -613,6 +614,7 @@ void recordPose() {
                   seq[seqLen - 1].a[0], seq[seqLen - 1].a[1], seq[seqLen - 1].a[2],
                   seq[seqLen - 1].a[3], seq[seqLen - 1].a[4], seq[seqLen - 1].a[5]);
     pendingBroadcast = true;
+    saveToFlash();
 }
 
 void renamePose(int idx, const char* name) {
@@ -646,6 +648,7 @@ void stopCycle() { isCycling = false; pendingBroadcast = true; }
 void clearRecording() {
     seqLen = 0; isPlaying = false; isCycling = false; pendingBroadcast = true;
     Serial.println("[REC] Cleared");
+    saveToFlash();
 }
 
 void saveToFlash() {
@@ -714,10 +717,22 @@ void runYellow() { playPreset(PRESET_YELLOW); }
 void runBlue()   { playPreset(PRESET_BLUE); }
 
 void savePresetsToFlash() {
+    // Serialize only the header + used poses. The Preset struct reserves
+    // MAX_POSES_PER_PRESET (30) slots but most presets use 1-15; writing the
+    // full 1344-byte struct every call exhausts NVS's log-structured 20 KB
+    // partition, silently drops later writes, and erases pre-existing blobs.
     prefs.begin("roboarm", false);
     for (uint8_t i = 0; i < MAX_PRESETS; i++) {
         char key[4]; snprintf(key, sizeof(key), "ps%u", (unsigned)i);
-        prefs.putBytes(key, &presets[i], sizeof(Preset));
+        int len = presets[i].len;
+        if (len < 0) len = 0;
+        if (len > MAX_POSES_PER_PRESET) len = MAX_POSES_PER_PRESET;
+        size_t bytes = offsetof(Preset, seq) + (size_t)len * sizeof(Pose);
+        size_t wrote = prefs.putBytes(key, &presets[i], bytes);
+        if (wrote != bytes) {
+            Serial.printf("[FLASH] Preset %u write FAILED (%u/%u bytes)\n",
+                          (unsigned)i, (unsigned)wrote, (unsigned)bytes);
+        }
     }
     prefs.end();
     Serial.printf("[FLASH] Presets saved (%u slots)\n", (unsigned)MAX_PRESETS);
@@ -741,10 +756,13 @@ void loadPresetsFromFlash() {
             presets[2].seq[0].a[j] = oldPick[j];
             presets[3].seq[0].a[j] = oldPlace[j];
         }
-        for (uint8_t i = 0; i < MAX_PRESETS; i++) presets[i].len = 1;
+        // Only the first 4 slots (Home/Ready/Pick/Place) got a pose from the
+        // old format; Red/Yellow/Blue stay at their compile-time len=0.
+        for (uint8_t i = 0; i < 4; i++) presets[i].len = 1;
         for (uint8_t i = 0; i < MAX_PRESETS; i++) {
             char key[4]; snprintf(key, sizeof(key), "ps%u", (unsigned)i);
-            prefs.putBytes(key, &presets[i], sizeof(Preset));
+            size_t bytes = offsetof(Preset, seq) + (size_t)presets[i].len * sizeof(Pose);
+            prefs.putBytes(key, &presets[i], bytes);
         }
         prefs.remove("ph"); prefs.remove("pr");
         prefs.remove("pk"); prefs.remove("pl");
@@ -755,7 +773,28 @@ void loadPresetsFromFlash() {
     prefs.begin("roboarm", true);
     for (uint8_t i = 0; i < MAX_PRESETS; i++) {
         char key[4]; snprintf(key, sizeof(key), "ps%u", (unsigned)i);
-        if (prefs.isKey(key)) prefs.getBytes(key, &presets[i], sizeof(Preset));
+        if (!prefs.isKey(key)) continue;
+        // Variable-size blob: could be a legacy 1344-byte write or a new
+        // short (24 + len*44) write. Read whatever's actually there.
+        size_t stored = prefs.getBytesLength(key);
+        if (stored < offsetof(Preset, seq) || stored > sizeof(Preset)) {
+            Serial.printf("[FLASH] Preset %u corrupt size (%u), skipping\n",
+                          (unsigned)i, (unsigned)stored);
+            continue;
+        }
+        prefs.getBytes(key, &presets[i], stored);
+        int len = presets[i].len;
+        size_t expectedNew = offsetof(Preset, seq) + (size_t)len * sizeof(Pose);
+        // Accept two on-disk shapes: new short blob (24 + len*44 bytes) OR
+        // legacy full-struct blob (sizeof(Preset)=1344 bytes). Anything else
+        // is genuinely corrupt.
+        bool okNew    = (stored == expectedNew);
+        bool okLegacy = (stored == sizeof(Preset));
+        if (len < 0 || len > MAX_POSES_PER_PRESET || (!okNew && !okLegacy)) {
+            Serial.printf("[FLASH] Preset %u len=%d inconsistent with %u bytes, resetting\n",
+                          (unsigned)i, len, (unsigned)stored);
+            presets[i].len = 0;
+        }
     }
     prefs.end();
 

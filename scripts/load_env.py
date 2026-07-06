@@ -8,7 +8,10 @@ keys = {
     "DEVICE_DEVELOPER_ID": "DEVICE_DEVELOPER_ID",
     "DEVICE_ACCESS_TOKEN": "DEVICE_ACCESS_TOKEN",
 }
-env_file = Path(env["PROJECT_DIR"]) / ".env"
+project_dir = Path(env["PROJECT_DIR"])
+env_file = project_dir / ".env.local"
+if not env_file.exists():
+    env_file = project_dir / ".env"
 found = set()
 
 if env_file.exists():
@@ -30,4 +33,4 @@ if env_file.exists():
 
 missing = {"DEVICE_DEVELOPER_ID", "DEVICE_ACCESS_TOKEN"} - found
 if missing:
-    raise RuntimeError(f"Missing {', '.join(sorted(missing))} in .env")
+    raise RuntimeError(f"Missing {', '.join(sorted(missing))} in .env.local")
