@@ -3,6 +3,7 @@
 #include "config.h"
 #include "arm.h"
 #include "input.h"
+#include "vision.h"
 #include "globals.h"
 #include <WiFi.h>
 
@@ -17,7 +18,7 @@ const char* buildStatus() {
         "{\"t\":\"s\",\"j\":[%d,%d,%d,%d,%d,%d],"
         "\"m\":%u,\"l\":%d,\"p\":%d,\"c\":%d,\"i\":%d,\"r\":%d,\"b\":%u,"
         "\"x\":%ld,\"y\":%ld,\"z\":%ld,\"rx\":%ld,\"ry\":%ld,\"rz\":%ld,"
-        "\"ik\":%d}",
+        "\"ik\":%d,\"tg\":%d}",
         joints[0].cur, joints[1].cur, joints[2].cur,
         joints[3].cur, joints[4].cur, joints[5].cur,
         (unsigned)joyMode, seqLen,
@@ -26,7 +27,8 @@ const char* buildStatus() {
         (unsigned)bootState,
         lroundf(fk.x),  lroundf(fk.y),  lroundf(fk.z),
         lroundf(fk.rx), lroundf(fk.ry), lroundf(fk.rz),
-        ikControlMode ? 1 : 0);
+        ikControlMode ? 1 : 0,
+        visionCurrentTag());   // -1 = none; ID otherwise (HuskyLens tag)
     return statusBuf;
 }
 
@@ -301,10 +303,31 @@ int importPosesFromJson(const char* buf, size_t len) {
 static char    importBuf[3200];
 static size_t  importLen = 0;
 
+// Shared color-sequence trigger. vision.cpp calls this directly instead of
+// HTTP-POSTing to our own /api/run/* routes — same code path, but no blocking
+// loopback request inside loop() and no WiFi dependency for an on-device
+// action. The WS "n" frame drives a browser toast so the operator sees who
+// fired the sequence.
+void triggerColorRun(const char* color, const char* src) {
+    Serial.printf("[%s] %s sequence triggered\n", src, color);
+    if (ws.count() > 0) {
+        char note[120];
+        snprintf(note, sizeof(note),
+            "{\"t\":\"n\",\"src\":\"%s\",\"color\":\"%s\","
+            "\"msg\":\"%s triggered %s sequence\"}",
+            src, color, src, color);
+        ws.textAll(note);
+    }
+    if      (strcmp(color, "red")    == 0) runRed();
+    else if (strcmp(color, "yellow") == 0) runYellow();
+    else if (strcmp(color, "blue")   == 0) runBlue();
+    pendingBroadcast = true;
+}
+
 void registerHttpRoutes(AsyncWebServer& srv) {
-    auto addRunRoute = [&](const char* path, const char* name, uint8_t idx, void (*fn)()) {
-        auto handler = [name, idx, fn](AsyncWebServerRequest* req) {
-            fn();
+    auto addRunRoute = [&](const char* path, const char* name, uint8_t idx) {
+        auto handler = [name, idx](AsyncWebServerRequest* req) {
+            triggerColorRun(name, "amr");
             char resp[80];
             snprintf(resp, sizeof(resp), "{\"ok\":true,\"preset\":\"%s\",\"len\":%d}",
                      name, presets[idx].len);
@@ -314,9 +337,9 @@ void registerHttpRoutes(AsyncWebServer& srv) {
         srv.on(path, HTTP_POST, handler);
     };
 
-    addRunRoute("/api/run/red",    "red",    PRESET_RED,    runRed);
-    addRunRoute("/api/run/yellow", "yellow", PRESET_YELLOW, runYellow);
-    addRunRoute("/api/run/blue",   "blue",   PRESET_BLUE,   runBlue);
+    addRunRoute("/api/run/red",    "red",    PRESET_RED);
+    addRunRoute("/api/run/yellow", "yellow", PRESET_YELLOW);
+    addRunRoute("/api/run/blue",   "blue",   PRESET_BLUE);
 
     srv.on("/poses.json", HTTP_GET, [](AsyncWebServerRequest* req){
         AsyncWebServerResponse* r = req->beginResponse(200, "application/json", buildPoses());

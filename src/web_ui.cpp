@@ -71,7 +71,7 @@ button.amb.on{background:linear-gradient(180deg,#e6a817,#c08810);color:#111;bord
 .kbd kbd{background:#0a1428;border:1px solid #2a3a5e;border-radius:3px;padding:1px 5px;margin:0 1px;font-family:Consolas,monospace;color:var(--ac3)}
 @media(max-width:520px){.jr{grid-template-columns:repeat(3,1fr)}.jc .v{font-size:.95rem}.spad{max-width:180px}}
 </style></head><body>
-<div class=hud><span class=dot id=dt></span><span class=tt>ROBOARM</span><span class=gap></span><button id=ikBtn class=pill style="cursor:pointer;border:none;font-size:.7rem;padding:3px 8px;border-radius:10px;background:var(--p2);color:var(--mu)" onclick=toggleIK() title="Toggle IK control mode">JOINT</button><span class=pill id=fsm style="color:#fff;background:#444;font-weight:700">--</span><span class=pill id=ip>--</span><span class=pill>RSSI <b id=rs>--</b></span><span class=pill id=gpd style=display:none>&#127918; <b>GP</b></span></div>
+<div class=hud><span class=dot id=dt></span><span class=tt>ROBOARM</span><span class=gap></span><button id=ikBtn class=pill style="cursor:pointer;border:none;font-size:.7rem;padding:3px 8px;border-radius:10px;background:var(--p2);color:var(--mu)" onclick=toggleIK() title="Toggle IK control mode">JOINT</button><span class=pill id=fsm style="color:#fff;background:#444;font-weight:700">--</span><span class=pill id=ip>--</span><span class=pill>RSSI <b id=rs>--</b></span><span class=pill id=tagp title="HuskyLens tag ID">&#127991; TAG <b id=tagv>&mdash;</b></span><span class=pill id=gpd style=display:none>&#127918; <b>GP</b></span></div>
 <div class=jr id=jr></div>
 <div class=pad>
  <div class=stk><div class=ttl id=sLt>LEFT STICK</div><div class=sub id=sLs>BASE / SHOULDER</div><div class=spad id=sL data-jx=0 data-jy=1><div class=knob></div></div><div class=kbd id=sLk><kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd></div></div>
@@ -178,7 +178,7 @@ function cn(){
  s.onopen=()=>{sd(1);tt('Connected');clearTimeout(rT)};
  s.onclose=()=>{sd(0);tt('Disconnected');rT=setTimeout(cn,2500)};
  s.onerror=()=>s.close();
- s.onmessage=(e)=>{const d=JSON.parse(e.data);if(d.t==='s')aS(d);else if(d.t==='p')aP(d);else if(d.t==='pl')aL(d)};
+ s.onmessage=(e)=>{const d=JSON.parse(e.data);if(d.t==='s')aS(d);else if(d.t==='p')aP(d);else if(d.t==='pl')aL(d);else if(d.t==='n')tt((d.src==='vision'?'🏷️ ':'🤖 ')+(d.msg||'event'))};
 }
 function w(x){if(s&&s.readyState===1)s.send(x)}
 function sd(o){const d=document.getElementById('dt');d.classList.toggle('ok',!!o);d.classList.toggle('err',!o)}
@@ -200,6 +200,16 @@ function aS(d){
  const cb=document.getElementById('bc');cb.classList.toggle('on',!!d.c);
  cb.innerHTML=d.c?'■ CYCLE LOOP &mdash; ON':'&#9654;&#9654; CYCLE LOOP &mdash; OFF';
  if(typeof d.r==='number')document.getElementById('rs').textContent=d.r+' dBm';
+ if(typeof d.tg==='number'){
+  // HuskyLens tag indicator: green + ID while a tag is in view, dim dash
+  // when none (firmware clears to -1 after 2s without a sighting)
+  const tp=document.getElementById('tagp'),tv=document.getElementById('tagv');
+  const seen=d.tg>=0;
+  tv.innerHTML=seen?d.tg:'&mdash;';
+  tp.style.color=seen?'#27ae60':'';
+  tv.style.color=seen?'#27ae60':'';
+  tp.style.borderColor=seen?'#27ae60':'';
+ }
  if(typeof d.x==='number'){
   document.getElementById('fk').textContent=`X: ${d.x} mm   Y: ${d.y} mm   Z: ${d.z} mm   |   Rx: ${d.rx}°   Ry: ${d.ry}°   Rz: ${d.rz}°`;
  }

@@ -23,4 +23,9 @@ bool visionInit();
 // Call every loop() tick. Internally rate-limited, so it's cheap to call
 // unconditionally even when bootState == STATE_FAULT.
 void visionPoll();
+
+// Last tag the camera saw: its ID (>= 0), or -1 when nothing has been seen
+// for VISION_TAG_HOLD_MS — so the UI indicator self-clears instead of
+// showing a stale detection forever.
+int visionCurrentTag();
  

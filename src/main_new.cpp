@@ -144,7 +144,17 @@ void loop() {
 
     // Vision runs independent of bootState/arm motion - HuskyLens detection    // <-- ADDED
     // and its HTTP POSTs should keep working even if the arm faulted.         // <-- ADDED
-    visionPoll();    
+    visionPoll();
+
+    // Push a status frame whenever the visible tag changes (including the
+    // -1 "cleared" transition) so the UI indicator updates without waiting
+    // for other activity.
+    static int lastTagShown = -2;
+    int curTag = visionCurrentTag();
+    if (curTag != lastTagShown) {
+        lastTagShown = curTag;
+        pendingBroadcast = true;
+    }
 
     // STATE_FAULT: skip every motion path. WS + serial stay alive so the user
     // sees the fault on the UI and can issue a STATUS / RAW probe over serial.
