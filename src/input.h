@@ -9,7 +9,7 @@ extern int     webJog[6];        // -100..+100 per joint, set by web/gamepad
 
 // ── Cartesian (IK) jog — sticks drive XYZ + Ry instead of joint angles
 extern bool    cartMode;          // false=joint jog, true=Cartesian jog
-extern int     cartJog[4];        // -100..+100: [0]=dx, [1]=dy, [2]=dz, [3]=dry
+extern int     cartJog[5];        // -100..+100: [0]=dx, [1]=dy, [2]=dz, [3]=dry, [4]=drx
 extern bool    cartJogActive;
 
 extern const uint8_t  PAIR[3][2];

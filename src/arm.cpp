@@ -736,7 +736,7 @@ void processCartJog() {
     lastMs = millis();
 
     bool any = false;
-    for (int i = 0; i < 4; i++) if (cartJog[i] != 0) { any = true; break; }
+    for (int i = 0; i < 5; i++) if (cartJog[i] != 0) { any = true; break; }
     cartJogActive = any;
     if (!any) return;
 
@@ -749,10 +749,14 @@ void processCartJog() {
     float ny = p.y  + (cartJog[1] / 100.0f) * CART_JOG_SPEED_MM;
     float nz = p.z  + (cartJog[2] / 100.0f) * CART_JOG_SPEED_MM;
     float nry = p.ry + (cartJog[3] / 100.0f) * CART_JOG_SPEED_DEG;
+    float nrx = p.rx + (cartJog[4] / 100.0f) * CART_JOG_SPEED_DEG;
 
-    // Solve IK — fixed Ry so orientation tracks the jog
+    // Solve IK — fixed Ry so orientation tracks the jog. Rx is passed as
+    // current+delta (not NAN): NAN means "neutral wrist roll" in solveIK,
+    // which was silently re-centering the roll on every jog tick. This way
+    // zero drx input HOLDS the current roll, nonzero steers it.
     float s[5];
-    if (!solveIK(nx, ny, nz, nry, /*fixed_ry=*/true, NAN, NAN, s)) return;
+    if (!solveIK(nx, ny, nz, nry, /*fixed_ry=*/true, nrx, NAN, s)) return;
 
     // Push to motion engine — float, so sub-degree jog increments aren't
     // rounded to zero motion

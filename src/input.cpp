@@ -22,7 +22,7 @@ bool     webJogActive = false;
 
 // ── Cartesian jog state ─────────────────────────────────────────────────────
 bool     cartMode      = false;
-int      cartJog[4]    = {0,0,0,0};    // dx, dy, dz, dry (-100..100)
+int      cartJog[5]    = {0,0,0,0,0};  // dx, dy, dz, dry, drx (-100..100)
 bool     cartJogActive = false;
 
 // ── Button debounce timers

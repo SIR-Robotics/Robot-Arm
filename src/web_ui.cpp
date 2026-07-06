@@ -272,14 +272,17 @@ function aS(d){
  }
  // Cartesian jog mode
  if(typeof d.cm==='number'){
+  if(cMode!==d.cm){cj=[0,0,0,0,0];lcj=[0,0,0,0,0]}  // mode flip → drop stale axes
   cMode=d.cm;
   const cb2=document.getElementById('cartbtn');
   cb2.classList.toggle('on',!!cMode);
   cb2.innerHTML=cMode?'🎯 CARTESIAN JOG — ON':'🎯 CARTESIAN JOG — OFF';
-  // Update stick labels
+  // Update stick + trigger labels
   const ls=document.querySelector('#sL .sub'),rs2=document.querySelector('#sR .sub');
   if(ls)ls.textContent=cMode?'X / Y':'BASE / SHOULDER';
-  if(rs2)rs2.textContent=cMode?'— / Z':'ELBOW / WRIST P.';
+  if(rs2)rs2.textContent=cMode?'ROLL / Z':'ELBOW / WRIST P.';
+  const tr=document.getElementById('tRt');
+  if(tr)tr.textContent=cMode?'PITCH Ry':'WRIST ROLL';
  }
 }
 function aP(d){ps=d.i||[];document.getElementById('rc').textContent=d.c;rP()}
@@ -305,6 +308,17 @@ function sR(i){
 // ── Cartesian jog toggle
 function togCart(){w('CM:'+(cMode?0:1))}
 
+// Composed Cartesian frame — every CJ message carries all 5 axes, so the two
+// sticks and the pitch trigger write into one shared array and a single
+// sender emits it. Independent w('CJ:...') calls would zero each other's axes
+// (that's what killed simultaneous multi-axis jogging).
+let cj=[0,0,0,0,0],lcj=[0,0,0,0,0];  // dx,dy,dz,dry,drx
+function sendCJ(){
+ let ch=false;
+ for(let i=0;i<5;i++){if(cj[i]!==lcj[i])ch=true;lcj[i]=cj[i]}
+ if(ch)w('CJ:'+cj.join(':'));
+}
+
 // ── XY thumbsticks
 const sticks=[];
 function bindStick(el){
@@ -313,9 +327,10 @@ function bindStick(el){
  const st={el,knob,jx,jy,vx:0,vy:0,lvx:0,lvy:0,active:false,kbx:0,kby:0,gpx:0,gpy:0};
  function send(){
   if(cMode){
-   // Cartesian mode: left stick → X/Y, right stick → ignore X / Y → Z
-   if(jx===0){w('CJ:'+st.vx+':'+st.vy+':0:0')}  // left stick → dx,dy
-   else{w('CJ:0:0:'+st.vy+':0')}                  // right stick Y → dz
+   // Cartesian mode: left stick → X/Y, right stick → roll (X) / Z (Y)
+   if(jx===0){cj[0]=st.vx;cj[1]=st.vy}
+   else{cj[2]=st.vy;cj[4]=st.vx}
+   sendCJ();
   }else{
    w('JX:'+jx+':'+st.vx+':'+jy+':'+(st.vy));
   }
@@ -360,11 +375,11 @@ function bindTrig(el){
  const j=+el.dataset.j,nb=el.querySelector('.tnb');
  const tg={el,nb,j,v:0,lv:0,kb:0,gp:0,L:0};
  function send(){
-  if(cMode){
-   // Cartesian mode: triggers → Ry pitch
-   w('CJ:0:0:0:'+tg.v);
+  if(cMode&&j===4){
+   // Cartesian mode: wrist-roll trigger repurposed as tool PITCH (Ry)
+   cj[3]=tg.v;sendCJ();
   }else{
-   w('JG:'+j+':'+tg.v);
+   w('JG:'+j+':'+tg.v);  // gripper (j=5) stays direct in every mode
   }
  }
  tg.send=send;

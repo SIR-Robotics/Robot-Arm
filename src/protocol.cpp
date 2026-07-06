@@ -94,7 +94,7 @@ void broadcastPresets() {
 //   LN:x:y:z[:ry]      LINE — straight-line interpolated move (free or fixed Ry)
 //   TO:0|1             tool-tip mode off / on
 //   CM:0|1             Cartesian jog mode off / on
-//   CJ:dx:dy:dz:dry    Cartesian jog axes (-100..100 each)
+//   CJ:dx:dy:dz:dry[:drx]  Cartesian jog axes (-100..100 each; drx = wrist roll)
 #define TAG(a,b) ((uint16_t)(((a)<<8) | (b)))
 
 void processWsCmd(char* msg) {
@@ -241,19 +241,21 @@ void processWsCmd(char* msg) {
             if (!args[0]) break;
             cartMode = (atoi(args[0]) != 0);
             if (!cartMode) {
-                for (int i = 0; i < 4; i++) cartJog[i] = 0;
+                for (int i = 0; i < 5; i++) cartJog[i] = 0;
                 cartJogActive = false;
             }
             Serial.printf("[CART] %s\n", cartMode ? "ON" : "OFF");
             pendingBroadcast = true;
             break;
         }
-        case TAG('C','J'): {                             // CJ:dx:dy:dz:dry  Cartesian jog axes
+        case TAG('C','J'): {                             // CJ:dx:dy:dz:dry[:drx]  Cartesian jog axes
             if (!args[0] || !args[1] || !args[2] || !args[3]) break;
             cartJog[0] = constrain(atoi(args[0]), -100, 100);
             cartJog[1] = constrain(atoi(args[1]), -100, 100);
             cartJog[2] = constrain(atoi(args[2]), -100, 100);
             cartJog[3] = constrain(atoi(args[3]), -100, 100);
+            // 5th axis (wrist roll) optional — older senders default to 0
+            cartJog[4] = args[4] ? constrain(atoi(args[4]), -100, 100) : 0;
             break;
         }
         case TAG('S','L'): {                             // SL:v  set motion speed (deg/sec)
