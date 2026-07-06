@@ -28,6 +28,7 @@ extern Preset presets[MAX_PRESETS];
 // ── Servo
 uint16_t toCounts(const Joint& j, int angle);
 void     setServo   (uint8_t i, int angle);   // smooth — sets servoTarget[i]
+void     setServoF  (uint8_t i, float angle); // float variant — IK/jog paths (no 1° rounding)
 void     setServoNow(uint8_t i, int angle);   // immediate I2C write (startup, RAW, TEST)
 void     sendPWM    (uint8_t i, int angle);   // raw fast path (no mutex — caller owns bus)
 void     moveToPose(const int p[6]);          // blocking, staged: Clearance → Elev → Align
@@ -66,7 +67,10 @@ struct Pose3D {
     float rx, ry, rz;  // deg — RPY: roll about tool, pitch from vertical, yaw about Z
 };
 
-Pose3D computeFK();    // reads servoCur[]
+Pose3D computeFK();    // reads servoCur[]; always wrist roll center
+Pose3D computeFKEffective(); // = computeFK(), but gripper TIP when toolMode is on —
+                             // the frame solveIK expects, so FK→IK round-trips
+                             // (cart jog, LINE, status) stay consistent
 void   printFK();      // emits the spec'd serial line (only when value changed)
 
 // ── Tool-tip mode ───────────────────────────────────────────────────────────
@@ -87,7 +91,7 @@ extern bool toolMode;
 // If finite, wrist roll = Z_W_ROLL + rx_deg (after RX_OUT_OFFSET), and Rz must
 // match the implied atan2(x,y) within tolerance — else the solve fails.
 bool solveIK(float x, float y, float z, float ry_deg, bool fixed_ry,
-             float rx_deg, float rz_deg, int out_logical[5]);
+             float rx_deg, float rz_deg, float out_logical[5]);
 void moveToXYZ(float x, float y, float z, float ry_deg, bool fixed_ry,
                float rx_deg = NAN, float rz_deg = NAN);
 

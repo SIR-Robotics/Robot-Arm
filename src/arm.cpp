@@ -95,6 +95,17 @@ float servoCur[6]    = {129, 62, 86, 86, 86, 0};
 float servoTarget[6] = {129, 62, 86, 86, 86, 0};
 float motionSpeed    = 40.0f;         // deg/sec — ~2.25s for a 90° move (matches preset speed)
 
+// Trapezoidal profile state: per-joint velocity, slewed at MOTION_ACCEL so
+// moves ramp in AND out instead of starting/stopping at full speed (jerk =
+// visible wobble on a desktop arm). 300°/s² reaches the 40°/s cruise in ~0.13s.
+static float    servoVel[6]  = {0, 0, 0, 0, 0, 0};
+constexpr float MOTION_ACCEL = 300.0f;   // deg/sec²
+
+// Last PWM count written per joint. The engine writes whenever the *count*
+// changes (~0.3–0.6°/count), not the whole degree — recovers the PWM's native
+// resolution. 0xFFFF = unknown/stale, forces a write on the next tick.
+static uint16_t lastCnt[6] = {0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF};
+
 // ── Tool-tip extension (mm beyond wrist roll center, along tool approach axis).
 // 111 mm = physical gripper length from the wrist roll motor face to the
 // closed-jaw tip. Used by toolMode IK to back-project the input target onto
@@ -104,8 +115,9 @@ bool toolMode = false;
 
 // ── Straight-line motion (LINE)
 constexpr float    LINE_STEP_MM = 10.0f;   // mm of Cartesian path per IK waypoint
-constexpr uint32_t LINE_STEP_MS = 120;     // ms per waypoint (≈ 83 mm/s Cartesian)
+constexpr uint32_t LINE_STEP_MS = 120;     // ms per waypoint — a FLOOR; settle gate paces
 constexpr int      LINE_MAX_STEPS = 200;   // safety cap → 2000 mm path
+constexpr float    LINE_SETTLE_DEG = 3.0f; // joints this close to target → next waypoint
 
 struct LineState {
     float x0, y0, z0;        // start (mm) at startLine()
@@ -146,10 +158,24 @@ uint16_t toCounts(const Joint& j, int angle) {
     return (uint16_t)(constrain(us, lo, hi) * 4096L / 20000L);
 }
 
-// Smooth path — UI/serial/playback/preset use this. processMotion picks it up.
-void setServo(uint8_t i, int angle) {
-    servoTarget[i] = (float)constrain(angle, joints[i].lo, joints[i].hi);
+// Float-angle variant for the motion engine / IK paths. The PWM grid is
+// ~4.88 µs/count ≈ 0.3–0.6°/count depending on the joint's µs span — rounding
+// the angle to int degrees first (the old path) quantized every move to 1°.
+static uint16_t toCountsF(const Joint& j, float angle) {
+    float us = j.minUs + (angle - j.lo) * (float)(j.maxUs - j.minUs) / (float)(j.hi - j.lo);
+    float lo = fminf(j.minUs, j.maxUs);
+    float hi = fmaxf(j.minUs, j.maxUs);
+    us = constrain(us, lo, hi);
+    return (uint16_t)(us * 4096.0f / 20000.0f);
 }
+
+// Smooth path — UI/serial/playback/preset use this. processMotion picks it up.
+// Float variant is the primary: IK/jog produce fractional degrees, and rounding
+// them to int here re-introduced the 1° dead-zone the float pipeline removes.
+void setServoF(uint8_t i, float angle) {
+    servoTarget[i] = constrain(angle, (float)joints[i].lo, (float)joints[i].hi);
+}
+void setServo(uint8_t i, int angle) { setServoF(i, (float)angle); }
 
 // Immediate path — startup, RAW, debug TEST. Bypasses motion engine entirely.
 void setServoNow(uint8_t i, int angle) {
@@ -157,6 +183,8 @@ void setServoNow(uint8_t i, int angle) {
     joints[i].cur  = angle;
     servoCur[i]    = (float)angle;
     servoTarget[i] = (float)angle;
+    servoVel[i]    = 0.0f;       // snap — discard any in-flight ramp velocity
+    lastCnt[i]     = 0xFFFF;     // engine's count cache is stale after a direct write
     int phys = joints[i].invert ? (joints[i].lo + joints[i].hi - angle) : angle;
     if (xSemaphoreTake(servoMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
         pca9685.setPWM(joints[i].ch, 0, toCounts(joints[i], phys));
@@ -167,6 +195,7 @@ void setServoNow(uint8_t i, int angle) {
 // Raw fast path — no mutex, no state sync. Only safe when caller owns the bus.
 void sendPWM(uint8_t i, int angle) {
     joints[i].cur = angle;
+    lastCnt[i]    = 0xFFFF;      // engine's count cache is stale after a raw write
     int phys = joints[i].invert ? (joints[i].lo + joints[i].hi - angle) : angle;
     pca9685.setPWM(joints[i].ch, 0, toCounts(joints[i], phys));
 }
@@ -339,28 +368,45 @@ void processMotion() {
     if (dt < 5) return;                              // ≤200 Hz tick
     lastMs = now;
 
-    float maxStep = motionSpeed * (dt * 0.001f);     // deg this tick
-    bool moved = false;
+    float dts   = dt * 0.001f;
+    bool  moved = false;
 
     for (int i = 0; i < 6; i++) {
         float diff = servoTarget[i] - servoCur[i];
-        if (fabsf(diff) < 0.05f) {
+        float dist = fabsf(diff);
+        if (dist < 0.02f && fabsf(servoVel[i]) < 1.0f) {
             servoCur[i] = servoTarget[i];
+            servoVel[i] = 0.0f;
             continue;
         }
-        float step = (fabsf(diff) <= maxStep) ? diff : (diff > 0 ? maxStep : -maxStep);
-        servoCur[i] += step;
 
-        int newAngle = (int)lroundf(servoCur[i]);
-        if (newAngle == joints[i].cur) continue;
+        // Trapezoidal profile: desired velocity is the cruise speed, capped by
+        // sqrt(2·a·d) so it ramps DOWN as the target nears (decel starts at
+        // v²/2a ≈ 2.7° out at 40°/s), and servoVel slews toward it at most
+        // a·dt per tick so it ramps UP from standstill too. Direction flips
+        // (jog reversal mid-move) decelerate through zero naturally.
+        float dir   = (diff >= 0.0f) ? 1.0f : -1.0f;
+        float vDes  = dir * fminf(motionSpeed, sqrtf(2.0f * MOTION_ACCEL * dist));
+        float dvMax = MOTION_ACCEL * dts;
+        servoVel[i] += constrain(vDes - servoVel[i], -dvMax, dvMax);
+        servoCur[i] += servoVel[i] * dts;
+        if ((servoTarget[i] - servoCur[i]) * dir <= 0.0f) {   // reached / crossed
+            servoCur[i] = servoTarget[i];
+            servoVel[i] = 0.0f;
+        }
 
-        int phys = joints[i].invert
-                 ? (joints[i].lo + joints[i].hi - newAngle)
-                 : newAngle;
+        joints[i].cur = (int)lroundf(servoCur[i]);   // logical readout (UI, recording)
+
+        // Write on PWM-count granularity (~0.3–0.6°), not whole degrees.
+        float phys = joints[i].invert
+                   ? (float)(joints[i].lo + joints[i].hi) - servoCur[i]
+                   : servoCur[i];
+        uint16_t cnt = toCountsF(joints[i], phys);
+        if (cnt == lastCnt[i]) continue;
         if (xSemaphoreTake(servoMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
-            joints[i].cur = newAngle;
-            pca9685.setPWM(joints[i].ch, 0, toCounts(joints[i], phys));
+            pca9685.setPWM(joints[i].ch, 0, cnt);
             xSemaphoreGive(servoMutex);
+            lastCnt[i] = cnt;
             moved = true;
         }
     }
@@ -395,8 +441,26 @@ Pose3D computeFK() {
     return p;
 }
 
-void printFK() {
+// FK in the frame the operator is *commanding*: wrist roll center normally,
+// gripper TIP when toolMode is on. solveIK interprets its input in exactly
+// this frame, so every FK→IK round-trip (cart jog, LINE start point, status
+// display) must use this — mixing frames commanded a point TOOL_OFFSET mm
+// inside the real pose the instant tool mode went live.
+Pose3D computeFKEffective() {
     Pose3D p = computeFK();
+    if (!toolMode) return p;
+    const float D2R = (float)M_PI / 180.0f;
+    float a234 = (p.ry + RY_OUT_OFFSET) * D2R;   // tool tilt from +Z (internal frame)
+    float t1   = atan2f(p.x, p.y);               // base azimuth from position
+    float rExt = TOOL_OFFSET * sinf(a234);       // radial component of the tool vector
+    p.x += rExt * sinf(t1);
+    p.y += rExt * cosf(t1);
+    p.z += TOOL_OFFSET * cosf(a234);
+    return p;
+}
+
+void printFK() {
+    Pose3D p = computeFKEffective();
     long x  = lroundf(p.x),  y  = lroundf(p.y),  z  = lroundf(p.z);
     long rx = lroundf(p.rx), ry = lroundf(p.ry), rz = lroundf(p.rz);
 
@@ -431,7 +495,7 @@ void printFK() {
 static constexpr float IK_RZ_TOL_DEG = 1.5f;
 
 bool solveIK(float x, float y, float z, float ry_deg, bool fixed_ry,
-             float rx_deg, float rz_deg, int out_logical[5]) {
+             float rx_deg, float rz_deg, float out_logical[5]) {
     const float D2R = (float)M_PI / 180.0f;
 
     // Tool-tip → wrist-center back-projection. Tool approach axis lies in the
@@ -487,7 +551,11 @@ bool solveIK(float x, float y, float z, float ry_deg, bool fixed_ry,
         float z2 = zi - L4 * cosf(ryi_rad);
         float d2    = r2*r2 + z2*z2;
         float cosT3 = (d2 - L2*L2 - L3*L3) / (2.0f * L2 * L3);
-        if (cosT3 < -1.0f || cosT3 > 1.0f) return false;
+        // Swallow float dust at the workspace boundary (full extension /
+        // full fold) — without this, LINE waypoints along max reach fail
+        // spuriously. Genuine overreach still rejects.
+        if (cosT3 >  1.0f) { if (cosT3 >  1.001f) return false; cosT3 =  1.0f; }
+        if (cosT3 < -1.0f) { if (cosT3 < -1.001f) return false; cosT3 = -1.0f; }
         t3 = acosf(cosT3);                              // elbow-up
         float A = L2 + L3 * cosf(t3);
         float B = L3 * sinf(t3);
@@ -501,7 +569,8 @@ bool solveIK(float x, float y, float z, float ry_deg, bool fixed_ry,
         float Le    = L3 + L4;
         float d2    = r*r + zi*zi;
         float cosT3 = (d2 - L2*L2 - Le*Le) / (2.0f * L2 * Le);
-        if (cosT3 < -1.0f || cosT3 > 1.0f) return false;
+        if (cosT3 >  1.0f) { if (cosT3 >  1.001f) return false; cosT3 =  1.0f; }
+        if (cosT3 < -1.0f) { if (cosT3 < -1.001f) return false; cosT3 = -1.0f; }
         t3 = acosf(cosT3);                              // elbow-up
         float A = L2 + Le * cosf(t3);
         float B = Le * sinf(t3);
@@ -515,25 +584,31 @@ bool solveIK(float x, float y, float z, float ry_deg, bool fixed_ry,
         ? Z_W_ROLL
         : (Z_W_ROLL + rx_deg + RX_OUT_OFFSET);
 
-    out_logical[0] = (int)lroundf(baseYawToLogical(t1 / D2R));
-    out_logical[1] = (int)lroundf(t2 / D2R + Z_SHOULDER);
-    out_logical[2] = (int)lroundf(t3 / D2R + Z_ELBOW);
-    out_logical[3] = (int)lroundf(t4 / D2R + Z_W_PITCH);
-    out_logical[4] = (int)lroundf(wr_deg);
+    // Float output — no rounding. The old int quantization made every solve
+    // ±0.5°/joint, which turned small Cartesian jogs (<0.5° per joint) into
+    // zero motion followed by 1° snaps.
+    out_logical[0] = baseYawToLogical(t1 / D2R);
+    out_logical[1] = t2 / D2R + Z_SHOULDER;
+    out_logical[2] = t3 / D2R + Z_ELBOW;
+    out_logical[3] = t4 / D2R + Z_W_PITCH;
+    out_logical[4] = wr_deg;
 
+    // 0.5° grace before rejecting, then clamp — parity with the old behavior
+    // where lroundf() pulled boundary solutions like 180.4° back in range.
     for (int i = 0; i < 5; i++) {
-        if (out_logical[i] < joints[i].lo || out_logical[i] > joints[i].hi) {
-            Serial.printf("[IK] joint %d (%s) out of range: %d ∉ [%d, %d]\n",
+        if (out_logical[i] < joints[i].lo - 0.5f || out_logical[i] > joints[i].hi + 0.5f) {
+            Serial.printf("[IK] joint %d (%s) out of range: %.1f ∉ [%d, %d]\n",
                           i, joints[i].name, out_logical[i], joints[i].lo, joints[i].hi);
             return false;
         }
+        out_logical[i] = constrain(out_logical[i], (float)joints[i].lo, (float)joints[i].hi);
     }
     return true;
 }
 
 void moveToXYZ(float x, float y, float z, float ry_deg, bool fixed_ry,
                float rx_deg, float rz_deg) {
-    int s[5];
+    float s[5];
     if (!solveIK(x, y, z, ry_deg, fixed_ry, rx_deg, rz_deg, s)) {
         Serial.printf("[IK] unreachable: (%.0f,%.0f,%.0f)%s%s\n",
                       x, y, z,
@@ -541,14 +616,14 @@ void moveToXYZ(float x, float y, float z, float ry_deg, bool fixed_ry,
                       toolMode ? " tool=ON" : "");
         return;
     }
-    Serial.printf("[IK] (%.0f,%.0f,%.0f%s%s%s%s) -> base=%d sh=%d el=%d wp=%d wr=%d\n",
+    Serial.printf("[IK] (%.0f,%.0f,%.0f%s%s%s%s) -> base=%.1f sh=%.1f el=%.1f wp=%.1f wr=%.1f\n",
                   x, y, z,
                   fixed_ry        ? " Ry" : "",
                   !isnan(rx_deg)  ? " Rx" : "",
                   !isnan(rz_deg)  ? " Rz" : "",
                   toolMode        ? " tool" : "",
                   s[0], s[1], s[2], s[3], s[4]);
-    for (int i = 0; i < 5; i++) setServo(i, s[i]);
+    for (int i = 0; i < 5; i++) setServoF(i, s[i]);
     pendingBroadcast = true;
 }
 
@@ -562,7 +637,9 @@ void moveToXYZ(float x, float y, float z, float ry_deg, bool fixed_ry,
 // Cancellation: presets / playback / cycle stop the line implicitly via the
 // guard in processLine(); call stopLine() to cancel from a handler.
 bool startLine(float xt, float yt, float zt, float ry_deg, bool fixed_ry) {
-    Pose3D p = computeFK();
+    // Effective frame: tip when toolMode — must match what solveIK expects,
+    // or the very first waypoint jumps TOOL_OFFSET mm off the real position.
+    Pose3D p = computeFKEffective();
     float dx_t = xt - p.x, dy_t = yt - p.y, dz_t = zt - p.z;
     float dist = sqrtf(dx_t*dx_t + dy_t*dy_t + dz_t*dz_t);
     if (dist < 1.0f) { Serial.println("[LINE] already at target"); return false; }
@@ -574,7 +651,7 @@ bool startLine(float xt, float yt, float zt, float ry_deg, bool fixed_ry) {
     }
 
     // Sanity-check the endpoint before moving — cheaper than failing mid-path.
-    int s[5];
+    float s[5];
     if (!solveIK(xt, yt, zt, ry_deg, fixed_ry, NAN, NAN, s)) {
         Serial.println("[LINE] endpoint unreachable — aborting");
         return false;
@@ -605,17 +682,25 @@ void processLine() {
     if (presetActive || isPlaying || isCycling) { stopLine(); return; }
     if (millis() < line.nextMs) return;
 
+    // Don't outrun the motion engine: hand out the next waypoint only when
+    // the joints are nearly at the previous one. 3° sits just above the
+    // trapezoid's decel-onset distance (v²/2a ≈ 2.7° at 40°/s), so waypoints
+    // blend at cruise speed instead of piling up and corner-cutting when a
+    // step needs more joint motion than LINE_STEP_MS allows.
+    for (int i = 0; i < 5; i++)
+        if (fabsf(servoTarget[i] - servoCur[i]) > LINE_SETTLE_DEG) return;
+
     float x = line.x0 + line.dx * line.curStep;
     float y = line.y0 + line.dy * line.curStep;
     float z = line.z0 + line.dz * line.curStep;
 
-    int s[5];
+    float s[5];
     if (!solveIK(x, y, z, line.ry_deg, line.fixed_ry, NAN, NAN, s)) {
         Serial.printf("[LINE] waypoint %d unreachable, stopping\n", line.curStep);
         lineActive = false;
         return;
     }
-    for (int i = 0; i < 5; i++) setServo(i, s[i]);
+    for (int i = 0; i < 5; i++) setServoF(i, s[i]);
     pendingBroadcast = true;
 
     if (line.curStep >= line.totalSteps) {
@@ -652,8 +737,9 @@ void processCartJog() {
     cartJogActive = any;
     if (!any) return;
 
-    // Current Cartesian position from FK
-    Pose3D p = computeFK();
+    // Current Cartesian position from FK — effective frame (tip in tool mode),
+    // matching solveIK's interpretation of the target below.
+    Pose3D p = computeFKEffective();
 
     // Apply deltas (normalised -100..100 → -1..1 × speed)
     float nx = p.x  + (cartJog[0] / 100.0f) * CART_JOG_SPEED_MM;
@@ -662,11 +748,12 @@ void processCartJog() {
     float nry = p.ry + (cartJog[3] / 100.0f) * CART_JOG_SPEED_DEG;
 
     // Solve IK — fixed Ry so orientation tracks the jog
-    int s[5];
+    float s[5];
     if (!solveIK(nx, ny, nz, nry, /*fixed_ry=*/true, NAN, NAN, s)) return;
 
-    // Push to motion engine
-    for (int i = 0; i < 5; i++) setServo(i, s[i]);
+    // Push to motion engine — float, so sub-degree jog increments aren't
+    // rounded to zero motion
+    for (int i = 0; i < 5; i++) setServoF(i, s[i]);
     pendingBroadcast = true;
 }
 

@@ -12,7 +12,9 @@ static char posesBuf[3000];
 
 // ── JSON builders ───────────────────────────────────────────────────────────
 const char* buildStatus() {
-    Pose3D fk = computeFK();
+    // Effective frame: tip when toolMode — the UI's XYZ readout must show the
+    // same point MV/LN commands accept (the "to" flag tells the UI which).
+    Pose3D fk = computeFKEffective();
     snprintf(statusBuf, sizeof(statusBuf),
         "{\"t\":\"s\",\"j\":[%d,%d,%d,%d,%d,%d],"
         "\"m\":%u,\"l\":%d,\"p\":%d,\"c\":%d,\"i\":%d,\"r\":%d,\"b\":%u,"
@@ -395,9 +397,7 @@ static void printHelp() {
     Serial.println();
 }
 
-void processSerial() {
-    if (!Serial.available()) return;
-    String cmd = Serial.readStringUntil('\n');
+static void handleSerialLine(String cmd) {
     cmd.trim(); cmd.toUpperCase();
     if (cmd.length() == 0) return;
 
@@ -572,7 +572,7 @@ void processSerial() {
     else if (cmd == "MOVE") {
         // No args — one-shot current FK readout (force-prints even if
         // printFK's change-detector is sitting on the same values).
-        Pose3D p = computeFK();
+        Pose3D p = computeFKEffective();
         Serial.printf("X: %ld mm, Y: %ld mm, Z: %ld mm | Rx: %ld, Ry: %ld, Rz: %ld\n",
             lroundf(p.x),  lroundf(p.y),  lroundf(p.z),
             lroundf(p.rx), lroundf(p.ry), lroundf(p.rz));
@@ -636,5 +636,26 @@ void processSerial() {
     else {
         Serial.printf("Unknown: '%s'\n", cmd.c_str());
         printHelp();
+    }
+}
+
+// Non-blocking line reader. The old readStringUntil('\n') blocked loop() for
+// up to 1 s (the Stream default timeout) whenever bytes arrived without a
+// newline — e.g. a monitor sending char-by-char — freezing the motion engine
+// mid-keystroke. Accumulate here, dispatch only on a complete line.
+void processSerial() {
+    static char   lineBuf[96];
+    static size_t n = 0;
+    while (Serial.available()) {
+        char c = (char)Serial.read();
+        if (c == '\n' || c == '\r') {
+            if (n > 0) {
+                lineBuf[n] = '\0';
+                n = 0;
+                handleSerialLine(String(lineBuf));
+            }
+        } else if (n < sizeof(lineBuf) - 1) {
+            lineBuf[n++] = c;
+        }
     }
 }

@@ -51,6 +51,8 @@ void setup() {
     bootState = STATE_INIT;
     Serial.println("[INIT] STATE_INIT — running self-audit");
     Wire.begin(I2C_SDA, I2C_SCL);
+    Wire.setClock(400000);   // PCA9685 handles Fast-mode; 100 kHz default costs
+                             // ~0.5 ms per servo write inside the motion tick
 
     // 1. I²C ACK probe: detects missing/unpowered PCA9685
     Wire.beginTransmission(PCA9685_ADDR);
