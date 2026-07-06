@@ -11,3 +11,11 @@ skills-lock.json
 .forge
 docs
 test
+
+# Node.js / Playwright
+node_modules
+test-results
+playwright-report
+package-lock.json
+
+.playwright-mcp

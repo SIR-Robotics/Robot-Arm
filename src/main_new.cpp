@@ -52,6 +52,8 @@ void setup() {
     bootState = STATE_INIT;
     Serial.println("[INIT] STATE_INIT — running self-audit");
     Wire.begin(I2C_SDA, I2C_SCL);
+    Wire.setClock(400000);   // PCA9685 handles Fast-mode; 100 kHz default costs
+                             // ~0.5 ms per servo write inside the motion tick
 
     // 1. I²C ACK probe: detects missing/unpowered PCA9685
     Wire.beginTransmission(PCA9685_ADDR);
@@ -143,16 +145,17 @@ void loop() {
     if (bootState != STATE_FAULT) {
         processJoystick();
         processWebJog();
-        processIkWebJog();
+        processCartJog();     // Cartesian IK jog (no-op when cartMode=false)
         processButtons();
         processPlayback();
         processPresetMove();  // advances staged preset moves between phases
+        processLine();        // straight-line interpolator (no-op when idle)
         processMotion();      // ramps servoCur -> servoTarget at motionSpeed
 
         // Recompute IDLE ↔ BUSY each tick. Only consider transitions once
         // homing is finished — INIT/HOMING/FAULT stay put.
         if (bootState == STATE_IDLE || bootState == STATE_BUSY) {
-            BootState target = (presetActive || isPlaying || isCycling)
+            BootState target = (presetActive || isPlaying || isCycling || lineActive)
                              ? STATE_BUSY : STATE_IDLE;
             if (target != bootState) {
                 bootState = target;
@@ -169,12 +172,11 @@ void loop() {
         lastCleanupMs = millis();
     }
 
-    if ((pendingBroadcast || joyActive || webJogActive || ikJogActive || ikWebJogActive)
+    if ((pendingBroadcast || joyActive || webJogActive || cartJogActive)
         && millis() - lastBroadMs >= 50) {
         broadcastStatus();
         lastBroadMs      = millis();
         pendingBroadcast = false;
-        ikJogActive      = false;
     }
 
     if (millis() - lastFkMs >= 500) {

@@ -1,8 +1,8 @@
 // ─── arm.cpp — Joint table, smooth motion engine, recording, playback ───────
 #include "arm.h"
+#include "input.h"
 #include "globals.h"
 #include <math.h>
-#include <cstddef>
 
 // ── Link geometry (mm) — measured from the physical arm.
 // FK origin = shoulder pivot (NOT base servo plate). The 43 mm base column
@@ -16,22 +16,67 @@ constexpr float L3 = 77.0f;   // forearm:   elbow → wrist pitch axis
 constexpr float L4 = 68.0f;   // wrist:     wrist pitch axis → wrist roll center
 
 // ── Joint zero offsets (logical degrees that correspond to FK "zero").
-// Reference pose (all zeros) = arm pointing straight up along +Z, base
-// forward along +X, wrist roll centered. Calibrated in a later phase.
-constexpr float Z_BASE     = 121.0f;
+// Reference pose (all zeros) = arm pointing straight along +Y forward,
+// wrist roll centered. Calibrated against the operator's "max Y" preset.
 constexpr float Z_SHOULDER =  65.0f;
 constexpr float Z_ELBOW    =  81.0f;
 constexpr float Z_W_PITCH  =  90.0f;
 constexpr float Z_W_ROLL   =  90.0f;
 
+// ── Base yaw — piecewise linear, asymmetric.
+// The base servo's physical mounting is NOT symmetric about forward: the
+// arm hits the mechanical limit at a different distance on each side of
+// the operator's +Y reference. A single Z_BASE offset (the old approach)
+// reads cleanly on one side and drifts on the other. Piecewise scale fixes
+// that: ±90° operator yaw lands exactly on the joint's lo/hi stops,
+// regardless of how off-center forward is.
+//
+//   BASE_FWD       = logical angle where arm physically points +Y forward.
+//   BASE_RIGHT_MAX = logical angle of the right-side mechanical stop (high end).
+//   BASE_LEFT_MAX  = logical angle of the  left-side mechanical stop (low  end).
+//
+// BASE_FWD was measured from the operator-saved "max Y" preset (Base=134°).
+// The two MAX constants currently mirror the joint-table software limits
+// (joints[0].lo / .hi); update them here if the physical stops sit inside
+// those values.
+constexpr float BASE_FWD       = 134.0f;
+constexpr float BASE_RIGHT_MAX = 270.0f;
+constexpr float BASE_LEFT_MAX  =   0.0f;
+
+// Slopes: degrees of operator yaw per degree of base servo motion.
+// 90° operator yaw ↔ (MAX − FWD) degrees of physical base rotation,
+// so SCALE = 90 / range. Pre-computed at compile time.
+constexpr float BASE_SCALE_RIGHT = 90.0f / (BASE_RIGHT_MAX - BASE_FWD);  // ≈ 0.662
+constexpr float BASE_SCALE_LEFT  = 90.0f / (BASE_FWD - BASE_LEFT_MAX);   // ≈ 0.672
+
+// Logical-base (servo deg) ↔ operator-yaw (deg) conversion. Branch on
+// which side of forward we're on; each side uses its own slope. These two
+// are inverses of each other across the full physical range.
+static inline float baseLogicalToYaw(float logical) {
+    return (logical >= BASE_FWD)
+        ? (logical - BASE_FWD) * BASE_SCALE_RIGHT
+        : (logical - BASE_FWD) * BASE_SCALE_LEFT;
+}
+static inline float baseYawToLogical(float yaw_deg) {
+    return (yaw_deg >= 0.0f)
+        ? BASE_FWD + yaw_deg / BASE_SCALE_RIGHT
+        : BASE_FWD + yaw_deg / BASE_SCALE_LEFT;
+}
+
 // ── Workspace bias — shifts FK output so the operator's preferred reference
-// pose reads as (X=0, Y=Y_max, Z=0, Ry=0). Decouples kinematic frame from
-// operator frame; tune by snapshotting current FK output at the desired
-// reference pose. Applied as a post-FK subtraction, so kinematic math
-// (sin/cos chain) stays geometrically correct.
+// pose reads as (X=0, Y=Y_max, Z=0, Rx=0, Ry=0, Rz=0). Decouples kinematic
+// frame from operator frame; tune by snapshotting current FK output at the
+// desired reference pose. Applied as a post-FK subtraction, so kinematic
+// math (sin/cos chain) stays geometrically correct.
+//
+// Rx and Rz offsets are currently zero — at the operator's max-Y reference
+// the wrist roll sits at Z_W_ROLL (Rx=0 by construction) and base sits at
+// BASE_FWD (Rz=0 by piecewise mapping). They're parameterised so future
+// reference-pose changes don't require touching the FK math.
 constexpr float Z_OUT_OFFSET  = 150.0f;   // mm — subtracted from FK z
+constexpr float RX_OUT_OFFSET =   0.0f;   // deg — subtracted from FK rx
 constexpr float RY_OUT_OFFSET =  49.0f;   // deg — subtracted from FK ry
-constexpr float IK_COS_EPS    =   0.02f;  // tolerance for integer-rounded FK waypoints
+constexpr float RZ_OUT_OFFSET =   0.0f;   // deg — subtracted from FK rz
 
 // ── Joint table ─────────────────────────────────────────────────────────────
 // minUs/maxUs are physical pulse-width calibration; counts derived per-tick.
@@ -48,7 +93,43 @@ Joint joints[6] = {
 // ── Smooth motion state
 float servoCur[6]    = {129, 62, 86, 86, 86, 0};
 float servoTarget[6] = {129, 62, 86, 86, 86, 0};
-float motionSpeed    = 120.0f;        // deg/sec — ~0.75s for a 90° move; snappy trigger response
+float motionSpeed    = 40.0f;         // deg/sec — ~2.25s for a 90° move (matches preset speed)
+
+// Trapezoidal profile state: per-joint velocity, slewed at MOTION_ACCEL so
+// moves ramp in AND out instead of starting/stopping at full speed (jerk =
+// visible wobble on a desktop arm). 300°/s² reaches the 40°/s cruise in ~0.13s.
+static float    servoVel[6]  = {0, 0, 0, 0, 0, 0};
+constexpr float MOTION_ACCEL = 300.0f;   // deg/sec²
+
+// Last PWM count written per joint. The engine writes whenever the *count*
+// changes (~0.3–0.6°/count), not the whole degree — recovers the PWM's native
+// resolution. 0xFFFF = unknown/stale, forces a write on the next tick.
+static uint16_t lastCnt[6] = {0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF};
+
+// ── Tool-tip extension (mm beyond wrist roll center, along tool approach axis).
+// 111 mm = physical gripper length from the wrist roll motor face to the
+// closed-jaw tip. Used by toolMode IK to back-project the input target onto
+// the wrist roll center before the 2-link solver runs.
+constexpr float TOOL_OFFSET = 111.0f;
+bool toolMode = false;
+
+// ── Straight-line motion (LINE)
+constexpr float    LINE_STEP_MM = 10.0f;   // mm of Cartesian path per IK waypoint
+constexpr uint32_t LINE_STEP_MS = 120;     // ms per waypoint — a FLOOR; settle gate paces
+constexpr int      LINE_MAX_STEPS = 200;   // safety cap → 2000 mm path
+constexpr float    LINE_SETTLE_DEG = 3.0f; // joints this close to target → next waypoint
+
+struct LineState {
+    float x0, y0, z0;        // start (mm) at startLine()
+    float dx, dy, dz;        // mm per step
+    float ry_deg;
+    bool  fixed_ry;
+    int   curStep;
+    int   totalSteps;
+    uint32_t nextMs;
+};
+static LineState line = {};
+bool lineActive = false;
 
 // ── Recording state
 Pose     seq[MAX_POSES];
@@ -60,23 +141,16 @@ uint32_t playNextMs = 0;
 
 Pose* playSrc    = nullptr;
 int   playSrcLen = 0;
-static bool playSrcIsFk = false;
 
 Preset presets[MAX_PRESETS] = {
-    { "Home",  1, { { { 129, 62, 86, 86, 86,  0 }, "" } } },
-    { "Ready", 1, { { {  90, 60, 90, 90, 90, 45 }, "" } } },
-    { "Pick",  1, { { {  90, 45, 45, 90, 90,  0 }, "" } } },
-    { "Place", 1, { { {  90, 45, 45, 90, 90, 90 }, "" } } },
-    { "Red",   0, { } },
-    { "Yellow", 0, { } },
-    { "Blue",  0, { } },
+    { "Home",   1, { { { 129, 62, 86, 86, 86,  0 }, "" } } },
+    { "Ready",  1, { { {  90, 60, 90, 90, 90, 45 }, "" } } },
+    { "Pick",   1, { { {  90, 45, 45, 90, 90,  0 }, "" } } },
+    { "Place",  1, { { {  90, 45, 45, 90, 90, 90 }, "" } } },
+    { "Red",    0, {} },      // color sequences — taught at runtime (SQ:idx),
+    { "Yellow", 0, {} },      // triggered by Favoriot MQTT / AMR HTTP routes
+    { "Blue",   0, {} },
 };
-
-static bool clampIkCosine(float& c) {
-    if (c < -1.0f - IK_COS_EPS || c > 1.0f + IK_COS_EPS) return false;
-    c = constrain(c, -1.0f, 1.0f);
-    return true;
-}
 
 // ── Servo math ──────────────────────────────────────────────────────────────
 uint16_t toCounts(const Joint& j, int angle) {
@@ -87,10 +161,24 @@ uint16_t toCounts(const Joint& j, int angle) {
     return (uint16_t)(constrain(us, lo, hi) * 4096L / 20000L);
 }
 
-// Smooth path — UI/serial/playback/preset use this. processMotion picks it up.
-void setServo(uint8_t i, int angle) {
-    servoTarget[i] = (float)constrain(angle, joints[i].lo, joints[i].hi);
+// Float-angle variant for the motion engine / IK paths. The PWM grid is
+// ~4.88 µs/count ≈ 0.3–0.6°/count depending on the joint's µs span — rounding
+// the angle to int degrees first (the old path) quantized every move to 1°.
+static uint16_t toCountsF(const Joint& j, float angle) {
+    float us = j.minUs + (angle - j.lo) * (float)(j.maxUs - j.minUs) / (float)(j.hi - j.lo);
+    float lo = fminf(j.minUs, j.maxUs);
+    float hi = fmaxf(j.minUs, j.maxUs);
+    us = constrain(us, lo, hi);
+    return (uint16_t)(us * 4096.0f / 20000.0f);
 }
+
+// Smooth path — UI/serial/playback/preset use this. processMotion picks it up.
+// Float variant is the primary: IK/jog produce fractional degrees, and rounding
+// them to int here re-introduced the 1° dead-zone the float pipeline removes.
+void setServoF(uint8_t i, float angle) {
+    servoTarget[i] = constrain(angle, (float)joints[i].lo, (float)joints[i].hi);
+}
+void setServo(uint8_t i, int angle) { setServoF(i, (float)angle); }
 
 // Immediate path — startup, RAW, debug TEST. Bypasses motion engine entirely.
 void setServoNow(uint8_t i, int angle) {
@@ -98,6 +186,8 @@ void setServoNow(uint8_t i, int angle) {
     joints[i].cur  = angle;
     servoCur[i]    = (float)angle;
     servoTarget[i] = (float)angle;
+    servoVel[i]    = 0.0f;       // snap — discard any in-flight ramp velocity
+    lastCnt[i]     = 0xFFFF;     // engine's count cache is stale after a direct write
     int phys = joints[i].invert ? (joints[i].lo + joints[i].hi - angle) : angle;
     if (xSemaphoreTake(servoMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
         pca9685.setPWM(joints[i].ch, 0, toCounts(joints[i], phys));
@@ -108,6 +198,7 @@ void setServoNow(uint8_t i, int angle) {
 // Raw fast path — no mutex, no state sync. Only safe when caller owns the bus.
 void sendPWM(uint8_t i, int angle) {
     joints[i].cur = angle;
+    lastCnt[i]    = 0xFFFF;      // engine's count cache is stale after a raw write
     int phys = joints[i].invert ? (joints[i].lo + joints[i].hi - angle) : angle;
     pca9685.setPWM(joints[i].ch, 0, toCounts(joints[i], phys));
 }
@@ -280,41 +371,63 @@ void processMotion() {
     if (dt < 5) return;                              // ≤200 Hz tick
     lastMs = now;
 
-    float maxStep = motionSpeed * (dt * 0.001f);     // deg this tick
-    bool moved = false;
+    float dts   = dt * 0.001f;
+    bool  moved = false;
 
     for (int i = 0; i < 6; i++) {
         float diff = servoTarget[i] - servoCur[i];
-        if (fabsf(diff) < 0.05f) {
+        float dist = fabsf(diff);
+        if (dist < 0.02f && fabsf(servoVel[i]) < 1.0f) {
             servoCur[i] = servoTarget[i];
+            servoVel[i] = 0.0f;
             continue;
         }
-        float step = (fabsf(diff) <= maxStep) ? diff : (diff > 0 ? maxStep : -maxStep);
-        servoCur[i] += step;
 
-        int newAngle = (int)lroundf(servoCur[i]);
-        if (newAngle == joints[i].cur) continue;
+        // Trapezoidal profile: desired velocity is the cruise speed, capped by
+        // sqrt(2·a·d) so it ramps DOWN as the target nears (decel starts at
+        // v²/2a ≈ 2.7° out at 40°/s), and servoVel slews toward it at most
+        // a·dt per tick so it ramps UP from standstill too. Direction flips
+        // (jog reversal mid-move) decelerate through zero naturally.
+        float dir   = (diff >= 0.0f) ? 1.0f : -1.0f;
+        float vDes  = dir * fminf(motionSpeed, sqrtf(2.0f * MOTION_ACCEL * dist));
+        float dvMax = MOTION_ACCEL * dts;
+        servoVel[i] += constrain(vDes - servoVel[i], -dvMax, dvMax);
+        servoCur[i] += servoVel[i] * dts;
+        if ((servoTarget[i] - servoCur[i]) * dir <= 0.0f) {   // reached / crossed
+            servoCur[i] = servoTarget[i];
+            servoVel[i] = 0.0f;
+        }
 
-        int phys = joints[i].invert
-                 ? (joints[i].lo + joints[i].hi - newAngle)
-                 : newAngle;
+        joints[i].cur = (int)lroundf(servoCur[i]);   // logical readout (UI, recording)
+
+        // Write on PWM-count granularity (~0.3–0.6°), not whole degrees.
+        float phys = joints[i].invert
+                   ? (float)(joints[i].lo + joints[i].hi) - servoCur[i]
+                   : servoCur[i];
+        uint16_t cnt = toCountsF(joints[i], phys);
+        if (cnt == lastCnt[i]) continue;
         if (xSemaphoreTake(servoMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
-            joints[i].cur = newAngle;
-            pca9685.setPWM(joints[i].ch, 0, toCounts(joints[i], phys));
+            pca9685.setPWM(joints[i].ch, 0, cnt);
             xSemaphoreGive(servoMutex);
+            lastCnt[i] = cnt;
             moved = true;
         }
     }
     if (moved) pendingBroadcast = true;
 }
 
-static Pose3D computeFKAt(const float a[5]) {
+// ── Forward kinematics ──────────────────────────────────────────────────────
+// Planar 4-link chain (shoulder/elbow/wrist-pitch + wrist offset) in the arm's
+// vertical plane, then rotated about Z by the base angle. Each pitch joint
+// is measured from +Z, so total tool tilt = θ2 + θ3 + θ4. Wrist roll is on
+// the tool axis — it changes orientation but not the wrist-center position.
+Pose3D computeFK() {
     const float D2R = (float)M_PI / 180.0f;
-    float t1 = (a[0] - Z_BASE)     * D2R;
-    float t2 = (a[1] - Z_SHOULDER) * D2R;
-    float t3 = (a[2] - Z_ELBOW)    * D2R;
-    float t4 = (a[3] - Z_W_PITCH)  * D2R;
-    float t5 = (a[4] - Z_W_ROLL)   * D2R;
+    float t1 = baseLogicalToYaw(servoCur[0]) * D2R;
+    float t2 = (servoCur[1] - Z_SHOULDER) * D2R;
+    float t3 = (servoCur[2] - Z_ELBOW)    * D2R;
+    float t4 = (servoCur[3] - Z_W_PITCH)  * D2R;
+    float t5 = (servoCur[4] - Z_W_ROLL)   * D2R;
 
     float a23  = t2 + t3;
     float a234 = a23 + t4;
@@ -325,23 +438,32 @@ static Pose3D computeFKAt(const float a[5]) {
     p.x  = r * sinf(t1);              // +X = right (base CW from above)
     p.y  = r * cosf(t1);              // +Y = forward (base θ1=0 → arm along +Y)
     p.z  = z  - Z_OUT_OFFSET;         // shifted: operator reference plane → Z=0
-    p.rx = t5 / D2R;                  // tool roll
-    p.ry = (a234 / D2R) - RY_OUT_OFFSET;  // shifted: operator reference → Ry=0
-    p.rz = t1 / D2R;                  // base yaw from +X
+    p.rx = (t5 / D2R) - RX_OUT_OFFSET;                     // tool roll
+    p.ry = (a234 / D2R) - RY_OUT_OFFSET;                   // tool pitch
+    p.rz = baseLogicalToYaw(servoCur[0]) - RZ_OUT_OFFSET;  // base yaw (piecewise)
     return p;
 }
 
-// ── Forward kinematics ──────────────────────────────────────────────────────
-// Planar 4-link chain (shoulder/elbow/wrist-pitch + wrist offset) in the arm's
-// vertical plane, then rotated about Z by the base angle. Each pitch joint
-// is measured from +Z, so total tool tilt = θ2 + θ3 + θ4. Wrist roll is on
-// the tool axis — it changes orientation but not the wrist-center position.
-Pose3D computeFK() {
-    return computeFKAt(servoCur);
+// FK in the frame the operator is *commanding*: wrist roll center normally,
+// gripper TIP when toolMode is on. solveIK interprets its input in exactly
+// this frame, so every FK→IK round-trip (cart jog, LINE start point, status
+// display) must use this — mixing frames commanded a point TOOL_OFFSET mm
+// inside the real pose the instant tool mode went live.
+Pose3D computeFKEffective() {
+    Pose3D p = computeFK();
+    if (!toolMode) return p;
+    const float D2R = (float)M_PI / 180.0f;
+    float a234 = (p.ry + RY_OUT_OFFSET) * D2R;   // tool tilt from +Z (internal frame)
+    float t1   = atan2f(p.x, p.y);               // base azimuth from position
+    float rExt = TOOL_OFFSET * sinf(a234);       // radial component of the tool vector
+    p.x += rExt * sinf(t1);
+    p.y += rExt * cosf(t1);
+    p.z += TOOL_OFFSET * cosf(a234);
+    return p;
 }
 
 void printFK() {
-    Pose3D p = computeFK();
+    Pose3D p = computeFKEffective();
     long x  = lroundf(p.x),  y  = lroundf(p.y),  z  = lroundf(p.z);
     long rx = lroundf(p.rx), ry = lroundf(p.ry), rz = lroundf(p.rz);
 
@@ -362,8 +484,43 @@ void printFK() {
 // target (r2, z2), then standard 2-link IK on L2/L3, then back out wrist
 // pitch from the orientation constraint. Elbow-up only — second solution
 // (elbow-down) omitted intentionally for predictability.
-bool solveIK(float x, float y, float z, float ry_deg, bool fixed_ry, int out_logical[5]) {
+//
+// Extended params:
+//   rx_deg — if finite, wrist roll = Z_W_ROLL + rx_deg + RX_OUT_OFFSET (mod invert).
+//            NaN = neutral wrist roll (default).
+//   rz_deg — if finite, validates atan2(x,y) matches it within IK_RZ_TOL_DEG.
+//            NaN = unconstrained (default). On this arm base yaw is fully
+//            determined by (x,y) — Rz is redundant, so this is a consistency
+//            check, not a degree of freedom.
+//   toolMode (file-scope) — if true, (x,y,z) is the gripper TIP, not the
+//            wrist roll center. Back-projects TOOL_OFFSET along the tool
+//            approach axis. Requires fixed_ry to know that axis.
+static constexpr float IK_RZ_TOL_DEG = 1.5f;
+
+bool solveIK(float x, float y, float z, float ry_deg, bool fixed_ry,
+             float rx_deg, float rz_deg, float out_logical[5]) {
     const float D2R = (float)M_PI / 180.0f;
+
+    // Tool-tip → wrist-center back-projection. Tool approach axis lies in the
+    // arm's vertical plane at azimuth atan2(x,y); its tilt from +Z is a234
+    // (=ry_internal). Subtract TOOL_OFFSET projected onto the radial and
+    // z directions. Requires fixed_ry — without it, a234 is determined by
+    // the solver, creating a chicken-and-egg.
+    if (toolMode) {
+        if (!fixed_ry) {
+            Serial.println("[IK] tool mode requires fixed Ry");
+            return false;
+        }
+        float ryi_rad = (ry_deg + RY_OUT_OFFSET) * D2R;
+        float r_tip   = sqrtf(x*x + y*y);
+        if (r_tip < 0.01f) { Serial.println("[IK] tool tip on base axis"); return false; }
+        float r_wrist = r_tip - TOOL_OFFSET * sinf(ryi_rad);
+        float z_wrist = z     - TOOL_OFFSET * cosf(ryi_rad);
+        float scale = r_wrist / r_tip;     // same azimuth, smaller radial
+        x = x * scale;
+        y = y * scale;
+        z = z_wrist;
+    }
 
     // Operator → internal frame (undo the workspace biases)
     float zi = z + Z_OUT_OFFSET;
@@ -371,6 +528,20 @@ bool solveIK(float x, float y, float z, float ry_deg, bool fixed_ry, int out_log
     // Base yaw + radial; +X right, +Y forward → t1 = atan2(x, y)
     float t1 = atan2f(x, y);
     float r  = sqrtf(x*x + y*y);
+
+    // Optional Rz consistency check — operator-supplied Rz must agree with
+    // the implied base yaw (mechanical coupling on this arm).
+    if (!isnan(rz_deg)) {
+        float t1_deg = t1 / D2R;
+        float diff   = rz_deg + RZ_OUT_OFFSET - t1_deg;
+        while (diff >  180.0f) diff -= 360.0f;
+        while (diff < -180.0f) diff += 360.0f;
+        if (fabsf(diff) > IK_RZ_TOL_DEG) {
+            Serial.printf("[IK] Rz=%.1f inconsistent with atan2(x,y)=%.1f (diff=%.1f > %.1f)\n",
+                          rz_deg, t1_deg, diff, IK_RZ_TOL_DEG);
+            return false;
+        }
+    }
 
     float t2, t3, t4;
 
@@ -383,7 +554,11 @@ bool solveIK(float x, float y, float z, float ry_deg, bool fixed_ry, int out_log
         float z2 = zi - L4 * cosf(ryi_rad);
         float d2    = r2*r2 + z2*z2;
         float cosT3 = (d2 - L2*L2 - L3*L3) / (2.0f * L2 * L3);
-        if (!clampIkCosine(cosT3)) return false;
+        // Swallow float dust at the workspace boundary (full extension /
+        // full fold) — without this, LINE waypoints along max reach fail
+        // spuriously. Genuine overreach still rejects.
+        if (cosT3 >  1.0f) { if (cosT3 >  1.001f) return false; cosT3 =  1.0f; }
+        if (cosT3 < -1.0f) { if (cosT3 < -1.001f) return false; cosT3 = -1.0f; }
         t3 = acosf(cosT3);                              // elbow-up
         float A = L2 + L3 * cosf(t3);
         float B = L3 * sinf(t3);
@@ -397,7 +572,8 @@ bool solveIK(float x, float y, float z, float ry_deg, bool fixed_ry, int out_log
         float Le    = L3 + L4;
         float d2    = r*r + zi*zi;
         float cosT3 = (d2 - L2*L2 - Le*Le) / (2.0f * L2 * Le);
-        if (!clampIkCosine(cosT3)) return false;
+        if (cosT3 >  1.0f) { if (cosT3 >  1.001f) return false; cosT3 =  1.0f; }
+        if (cosT3 < -1.0f) { if (cosT3 < -1.001f) return false; cosT3 = -1.0f; }
         t3 = acosf(cosT3);                              // elbow-up
         float A = L2 + Le * cosf(t3);
         float B = Le * sinf(t3);
@@ -405,216 +581,193 @@ bool solveIK(float x, float y, float z, float ry_deg, bool fixed_ry, int out_log
         t4 = 0.0f;
     }
 
-    out_logical[0] = (int)lroundf(t1 / D2R + Z_BASE);
-    out_logical[1] = (int)lroundf(t2 / D2R + Z_SHOULDER);
-    out_logical[2] = (int)lroundf(t3 / D2R + Z_ELBOW);
-    out_logical[3] = (int)lroundf(t4 / D2R + Z_W_PITCH);
-    out_logical[4] = (int)lroundf(Z_W_ROLL);            // hold wrist roll neutral
+    // Wrist roll: caller-supplied Rx, or neutral. 1:1 mapping (no nonlinearity
+    // expected on the WR joint).
+    float wr_deg = isnan(rx_deg)
+        ? Z_W_ROLL
+        : (Z_W_ROLL + rx_deg + RX_OUT_OFFSET);
 
+    // Float output — no rounding. The old int quantization made every solve
+    // ±0.5°/joint, which turned small Cartesian jogs (<0.5° per joint) into
+    // zero motion followed by 1° snaps.
+    out_logical[0] = baseYawToLogical(t1 / D2R);
+    out_logical[1] = t2 / D2R + Z_SHOULDER;
+    out_logical[2] = t3 / D2R + Z_ELBOW;
+    out_logical[3] = t4 / D2R + Z_W_PITCH;
+    out_logical[4] = wr_deg;
+
+    // 0.5° grace before rejecting, then clamp — parity with the old behavior
+    // where lroundf() pulled boundary solutions like 180.4° back in range.
     for (int i = 0; i < 5; i++) {
-        if (out_logical[i] < joints[i].lo || out_logical[i] > joints[i].hi) {
-            return false;                               // joint stop blocks it
+        if (out_logical[i] < joints[i].lo - 0.5f || out_logical[i] > joints[i].hi + 0.5f) {
+            Serial.printf("[IK] joint %d (%s) out of range: %.1f ∉ [%d, %d]\n",
+                          i, joints[i].name, out_logical[i], joints[i].lo, joints[i].hi);
+            return false;
         }
+        out_logical[i] = constrain(out_logical[i], (float)joints[i].lo, (float)joints[i].hi);
     }
     return true;
 }
 
-// ── 6-DOF Inverse Kinematics (full position + orientation) ──────────────────
-// Solves all 5 arm joints (base/shoulder/elbow/wrist-pitch/wrist-roll) from
-// a target (x,y,z) and tool orientation (rx=roll, ry=pitch, both degrees).
-// rz is NOT an input — the base angle is determined by atan2(x,y).
-//
-// Algorithm (analytical, closed-form):
-//   1. Base yaw t1 = atan2(x, y) — arm is a planar chain rotated about Z.
-//   2. Tool orientation constrains total pitch a234 = t2+t3+t4 = ry.
-//   3. Wrist roll t5 = rx (direct, on tool axis).
-//   4. Step back L4 along the tool axis → wrist-pitch joint center (r2,z2).
-//   5. Standard 2-link IK (cosine rule) on L2-L3 with elbow-up (acos positive).
-//   6. Back-solve t4 from the orientation constraint: t4 = a234 - t2 - t3.
-//   7. Convert kinematic angles → logical servo degrees via zero-offset table.
-//   8. Clamp each joint to [lo, hi]; return false if any hit.
-//
-// Reference: Peter Corke, "Robotics, Vision and Control" §7.3 — planar arm IK.
-bool solveIK6DOF(float x, float y, float z, float rx_deg, float ry_deg,
-                 int out_logical[5]) {
-    const float D2R = (float)M_PI / 180.0f;
-
-    float zi = z + Z_OUT_OFFSET;
-    float t1 = atan2f(x, y);
-    float rad = sqrtf(x*x + y*y);
-
-    float a234 = (ry_deg + RY_OUT_OFFSET) * D2R;
-    float t5   =  rx_deg * D2R;
-
-    float r2 = rad - L4 * sinf(a234);
-    float z2 = zi  - L4 * cosf(a234);
-
-    float d2    = r2*r2 + z2*z2;
-    float cosT3 = (d2 - L2*L2 - L3*L3) / (2.0f * L2 * L3);
-    if (!clampIkCosine(cosT3)) return false;
-
-    float t3_options[2] = { acosf(cosT3), -acosf(cosT3) };
-
-    float bestErr       = 1e9f;
-    float bestJointCost = 1e9f;
-    bool  found   = false;
-    int   bestJ[5];
-
-    for (int bc = 0; bc < 4; bc++) {
-        float tb = t1 + bc * (float)M_PI;
-        int baseL = (int)lroundf(tb / D2R + Z_BASE);
-        if (baseL < joints[0].lo || baseL > joints[0].hi) continue;
-
-        for (int branch = 0; branch < 2; branch++) {
-            float t3 = t3_options[branch];
-            float A  = L2 + L3 * cosf(t3);
-            float B  = L3 * sinf(t3);
-            float t2 = atan2f(A*r2 - B*z2, B*r2 + A*z2);
-            float t4 = a234 - t2 - t3;
-
-            int cand[5];
-            cand[0] = baseL;
-            cand[1] = (int)lroundf(t2 / D2R + Z_SHOULDER);
-            cand[2] = (int)lroundf(t3 / D2R + Z_ELBOW);
-            cand[3] = (int)lroundf(t4 / D2R + Z_W_PITCH);
-            cand[4] = (int)lroundf(t5 / D2R + Z_W_ROLL);
-
-            bool valid = true;
-            for (int i = 1; i < 5; i++) {
-                if (cand[i] < joints[i].lo || cand[i] > joints[i].hi) {
-                    valid = false; break;
-                }
-            }
-            if (!valid) continue;
-
-            // Evaluate FK position error, then prefer the branch nearest the
-            // current target so IK jogs do not flip between equivalent poses.
-            float  ca[5] = {(float)cand[0],(float)cand[1],(float)cand[2],
-                             (float)cand[3],(float)cand[4]};
-            Pose3D fk = computeFKAt(ca);
-            float cxErr = fk.x - x, cyErr = fk.y - y, czErr = fk.z - z;
-            float err = cxErr*cxErr + cyErr*cyErr + czErr*czErr;
-            float jointCost = 0.0f;
-            for (int i = 0; i < 5; i++) {
-                float d = cand[i] - servoTarget[i];
-                jointCost += d * d;
-            }
-
-            if (err < bestErr - 1.0f ||
-                (fabsf(err - bestErr) <= 1.0f && jointCost < bestJointCost)) {
-                bestErr = err;
-                bestJointCost = jointCost;
-                for (int i = 0; i < 5; i++) bestJ[i] = cand[i];
-                found = true;
-            }
-        }
+void moveToXYZ(float x, float y, float z, float ry_deg, bool fixed_ry,
+               float rx_deg, float rz_deg) {
+    float s[5];
+    if (!solveIK(x, y, z, ry_deg, fixed_ry, rx_deg, rz_deg, s)) {
+        Serial.printf("[IK] unreachable: (%.0f,%.0f,%.0f)%s%s\n",
+                      x, y, z,
+                      fixed_ry ? " Ry=fixed" : "",
+                      toolMode ? " tool=ON" : "");
+        return;
     }
-    if (!found) return false;
-    // Reject solutions with large position error (incremential jog near origin
-    // can produce wrong-quadrant solutions when FK had r<0).
-    if (bestErr > 100.0f) return false;               // >10 mm² error → treat as unreachable
-    for (int i = 0; i < 5; i++) out_logical[i] = bestJ[i];
-    return true;
-}
-
-// IK control mode — toggled via serial/web. When active, joystick and web
-// controls move the end-effector in world coordinates instead of jogging
-// individual joints. Gripper (joint 5) stays in direct mode always.
-bool ikControlMode = false;
-bool ikJogActive   = false;
-
-// Relative IK jog: compute current FK, add world-frame delta, re-solve.
-// Silently ignores unreachable targets so the user can push out and back
-// without hitting an error on every out-of-workspace tick.
-void ikJogDelta(float dx, float dy, float dz, float dry, float drx) {
-    float targetPose[5] = { servoTarget[0], servoTarget[1], servoTarget[2],
-                            servoTarget[3], servoTarget[4] };
-    Pose3D cur = computeFKAt(targetPose);
-    float tx = cur.x + dx;
-    float ty = cur.y + dy;
-    float tz = cur.z + dz;
-    float trx = cur.rx + drx;
-    float try_deg = cur.ry + dry;
-
-    int s[5];
-    if (!solveIK6DOF(tx, ty, tz, trx, try_deg, s)) return;
-
-    for (int i = 0; i < 5; i++) setServo(i, s[i]);
-    ikJogActive = true;
+    Serial.printf("[IK] (%.0f,%.0f,%.0f%s%s%s%s) -> base=%.1f sh=%.1f el=%.1f wp=%.1f wr=%.1f\n",
+                  x, y, z,
+                  fixed_ry        ? " Ry" : "",
+                  !isnan(rx_deg)  ? " Rx" : "",
+                  !isnan(rz_deg)  ? " Rz" : "",
+                  toolMode        ? " tool" : "",
+                  s[0], s[1], s[2], s[3], s[4]);
+    for (int i = 0; i < 5; i++) setServoF(i, s[i]);
     pendingBroadcast = true;
 }
 
-void moveToXYZ(float x, float y, float z, float ry_deg, bool fixed_ry) {
-    int s[5];
-    if (!solveIK(x, y, z, ry_deg, fixed_ry, s)) {
-        if (fixed_ry) {
-            Serial.printf("[IK] unreachable: (%.0f, %.0f, %.0f, Ry=%.0f)\n",
-                          x, y, z, ry_deg);
-        } else {
-            Serial.printf("[IK] unreachable: (%.0f, %.0f, %.0f) free-Ry\n",
-                          x, y, z);
-        }
+// ── Straight-line interpolator ──────────────────────────────────────────────
+// Computes the current wrist position via FK, splits the segment to (xt,yt,zt)
+// into LINE_STEP_MM chunks, and pushes one IK solution per LINE_STEP_MS tick
+// into the motion engine. The engine ramps between consecutive waypoints, so
+// the tool traces a polyline that approximates a straight line in Cartesian
+// space.
+//
+// Cancellation: presets / playback / cycle stop the line implicitly via the
+// guard in processLine(); call stopLine() to cancel from a handler.
+bool startLine(float xt, float yt, float zt, float ry_deg, bool fixed_ry) {
+    // Effective frame: tip when toolMode — must match what solveIK expects,
+    // or the very first waypoint jumps TOOL_OFFSET mm off the real position.
+    Pose3D p = computeFKEffective();
+    float dx_t = xt - p.x, dy_t = yt - p.y, dz_t = zt - p.z;
+    float dist = sqrtf(dx_t*dx_t + dy_t*dy_t + dz_t*dz_t);
+    if (dist < 1.0f) { Serial.println("[LINE] already at target"); return false; }
+
+    int steps = (int)ceilf(dist / LINE_STEP_MM);
+    if (steps > LINE_MAX_STEPS) {
+        Serial.printf("[LINE] path too long (%d steps > %d)\n", steps, LINE_MAX_STEPS);
+        return false;
+    }
+
+    // Sanity-check the endpoint before moving — cheaper than failing mid-path.
+    float s[5];
+    if (!solveIK(xt, yt, zt, ry_deg, fixed_ry, NAN, NAN, s)) {
+        Serial.println("[LINE] endpoint unreachable — aborting");
+        return false;
+    }
+
+    line.x0 = p.x; line.y0 = p.y; line.z0 = p.z;
+    line.dx = dx_t / steps;
+    line.dy = dy_t / steps;
+    line.dz = dz_t / steps;
+    line.ry_deg     = ry_deg;
+    line.fixed_ry   = fixed_ry;
+    line.curStep    = 1;
+    line.totalSteps = steps;
+    line.nextMs     = millis();
+    lineActive      = true;
+    Serial.printf("[LINE] %d steps × %.1f mm -> (%.0f,%.0f,%.0f)\n",
+                  steps, dist / steps, xt, yt, zt);
+    return true;
+}
+
+void stopLine() {
+    if (lineActive) Serial.println("[LINE] stopped");
+    lineActive = false;
+}
+
+void processLine() {
+    if (!lineActive) return;
+    if (presetActive || isPlaying || isCycling) { stopLine(); return; }
+    if (millis() < line.nextMs) return;
+
+    // Don't outrun the motion engine: hand out the next waypoint only when
+    // the joints are nearly at the previous one. 3° sits just above the
+    // trapezoid's decel-onset distance (v²/2a ≈ 2.7° at 40°/s), so waypoints
+    // blend at cruise speed instead of piling up and corner-cutting when a
+    // step needs more joint motion than LINE_STEP_MS allows.
+    for (int i = 0; i < 5; i++)
+        if (fabsf(servoTarget[i] - servoCur[i]) > LINE_SETTLE_DEG) return;
+
+    float x = line.x0 + line.dx * line.curStep;
+    float y = line.y0 + line.dy * line.curStep;
+    float z = line.z0 + line.dz * line.curStep;
+
+    float s[5];
+    if (!solveIK(x, y, z, line.ry_deg, line.fixed_ry, NAN, NAN, s)) {
+        Serial.printf("[LINE] waypoint %d unreachable, stopping\n", line.curStep);
+        lineActive = false;
         return;
     }
-    if (fixed_ry) {
-        Serial.printf("[IK] (%.0f, %.0f, %.0f, Ry=%.0f) -> base=%d sh=%d el=%d wp=%d wr=%d\n",
-                      x, y, z, ry_deg, s[0], s[1], s[2], s[3], s[4]);
+    for (int i = 0; i < 5; i++) setServoF(i, s[i]);
+    pendingBroadcast = true;
+
+    if (line.curStep >= line.totalSteps) {
+        Serial.println("[LINE] Done");
+        lineActive = false;
     } else {
-        Serial.printf("[IK] (%.0f, %.0f, %.0f) free-Ry -> base=%d sh=%d el=%d wp=%d wr=%d\n",
-                      x, y, z, s[0], s[1], s[2], s[3], s[4]);
+        line.curStep++;
+        line.nextMs = millis() + LINE_STEP_MS;
     }
-    for (int i = 0; i < 5; i++) setServo(i, s[i]);
+}
+
+// ── Cartesian jog engine ────────────────────────────────────────────────────
+// Each tick: FK → offset by cartJog[] → IK → servoTarget[]. Rate-limited to
+// ~50 Hz. If IK fails the arm simply stays put (no error flood). Ry is
+// managed as a delta too, so the operator can tilt the tool while jogging.
+// The jog speed is in mm/tick at full deflection (100); at 50 Hz, 2 mm/tick
+// ≈ 100 mm/s Cartesian velocity — comfortable for a desktop arm.
+constexpr float CART_JOG_SPEED_MM  = 2.0f;   // mm per tick at full deflection
+constexpr float CART_JOG_SPEED_DEG = 1.5f;   // deg per tick at full Ry deflection
+constexpr uint32_t CART_JOG_INTERVAL = 20;   // ms — 50 Hz
+
+void processCartJog() {
+    if (!cartMode) { cartJogActive = false; return; }
+    if (isPlaying || isCycling || presetActive || lineActive) {
+        cartJogActive = false; return;
+    }
+
+    static uint32_t lastMs = 0;
+    if (millis() - lastMs < CART_JOG_INTERVAL) return;
+    lastMs = millis();
+
+    bool any = false;
+    for (int i = 0; i < 4; i++) if (cartJog[i] != 0) { any = true; break; }
+    cartJogActive = any;
+    if (!any) return;
+
+    // Current Cartesian position from FK — effective frame (tip in tool mode),
+    // matching solveIK's interpretation of the target below.
+    Pose3D p = computeFKEffective();
+
+    // Apply deltas (normalised -100..100 → -1..1 × speed)
+    float nx = p.x  + (cartJog[0] / 100.0f) * CART_JOG_SPEED_MM;
+    float ny = p.y  + (cartJog[1] / 100.0f) * CART_JOG_SPEED_MM;
+    float nz = p.z  + (cartJog[2] / 100.0f) * CART_JOG_SPEED_MM;
+    float nry = p.ry + (cartJog[3] / 100.0f) * CART_JOG_SPEED_DEG;
+
+    // Solve IK — fixed Ry so orientation tracks the jog
+    float s[5];
+    if (!solveIK(nx, ny, nz, nry, /*fixed_ry=*/true, NAN, NAN, s)) return;
+
+    // Push to motion engine — float, so sub-degree jog increments aren't
+    // rounded to zero motion
+    for (int i = 0; i < 5; i++) setServoF(i, s[i]);
     pendingBroadcast = true;
 }
 
 // ── Recording ───────────────────────────────────────────────────────────────
-bool solveRecordedWaypoint(const Pose& pose, int out[5], int* usedRy) {
-    const int* a = pose.a; // X,Y,Z,Ry,Rx,Gripper
-    if (usedRy) *usedRy = a[3];
-
-    if (solveIK6DOF((float)a[0], (float)a[1], (float)a[2],
-                    (float)a[4], (float)a[3], out)) {
-        return true;
-    }
-
-    for (int d = 1; d <= 15; d++) {
-        for (int sign = -1; sign <= 1; sign += 2) {
-            int ry = a[3] + sign * d;
-            if (solveIK6DOF((float)a[0], (float)a[1], (float)a[2],
-                            (float)a[4], (float)ry, out)) {
-                if (usedRy) *usedRy = ry;
-                return true;
-            }
-        }
-    }
-
-    if (solveIK((float)a[0], (float)a[1], (float)a[2], 0.0f,
-                /*fixed_ry=*/false, out)) {
-        out[4] = constrain(a[4] + (int)lroundf(Z_W_ROLL), joints[4].lo, joints[4].hi);
-        if (usedRy) *usedRy = 999;
-        return true;
-    }
-
-    return false;
-}
-
 void recordPose() {
     if (seqLen >= MAX_POSES) { Serial.println("[REC] Full"); return; }
-    Pose3D fk = computeFK();
-    seq[seqLen].a[0] = (int)lroundf(fk.x);
-    seq[seqLen].a[1] = (int)lroundf(fk.y);
-    seq[seqLen].a[2] = (int)lroundf(fk.z);
-    seq[seqLen].a[3] = (int)lroundf(fk.ry);
-    seq[seqLen].a[4] = (int)lroundf(fk.rx);
-    seq[seqLen].a[5] = joints[5].cur;
+    for (int i = 0; i < 6; i++) seq[seqLen].a[i] = joints[i].cur;
     snprintf(seq[seqLen].label, sizeof(seq[seqLen].label), "Pose %d", seqLen + 1);
     seqLen++;
-    Serial.printf("[REC] %d total  FK=(%d,%d,%d Ry=%d Rx=%d G=%d)\n",
-                  seqLen,
-                  seq[seqLen - 1].a[0], seq[seqLen - 1].a[1], seq[seqLen - 1].a[2],
-                  seq[seqLen - 1].a[3], seq[seqLen - 1].a[4], seq[seqLen - 1].a[5]);
+    Serial.printf("[REC] %d total\n", seqLen);
     pendingBroadcast = true;
-    saveToFlash();
 }
 
 void renamePose(int idx, const char* name) {
@@ -626,7 +779,6 @@ void renamePose(int idx, const char* name) {
 void startPlayback() {
     if (!seqLen) { Serial.println("[PLAY] Empty"); return; }
     playSrc = seq; playSrcLen = seqLen;
-    playSrcIsFk = true;
     isCycling = false; isPlaying = true;
     playIdx = 0; playNextMs = millis();
     pendingBroadcast = true;
@@ -637,7 +789,6 @@ void stopPlayback() { isPlaying = false; isCycling = false; pendingBroadcast = t
 void startCycle() {
     if (!seqLen) { Serial.println("[CYCLE] Empty"); return; }
     playSrc = seq; playSrcLen = seqLen;
-    playSrcIsFk = true;
     isPlaying = false; isCycling = true;
     playIdx = 0; playNextMs = millis();
     pendingBroadcast = true;
@@ -648,7 +799,6 @@ void stopCycle() { isCycling = false; pendingBroadcast = true; }
 void clearRecording() {
     seqLen = 0; isPlaying = false; isCycling = false; pendingBroadcast = true;
     Serial.println("[REC] Cleared");
-    saveToFlash();
 }
 
 void saveToFlash() {
@@ -703,7 +853,6 @@ void playPreset(uint8_t idx) {
         // Multi-pose preset → playback through motion engine
         playSrc = presets[idx].seq;
         playSrcLen = presets[idx].len;
-        playSrcIsFk = true;
         isCycling = false; isPlaying = true;
         playIdx = 0; playNextMs = millis();
         pendingBroadcast = true;
@@ -712,27 +861,17 @@ void playPreset(uint8_t idx) {
     }
 }
 
+// Color-preset wrappers — the Favoriot MQTT handler and the /api/run/* AMR
+// routes trigger these by name.
 void runRed()    { playPreset(PRESET_RED); }
 void runYellow() { playPreset(PRESET_YELLOW); }
 void runBlue()   { playPreset(PRESET_BLUE); }
 
 void savePresetsToFlash() {
-    // Serialize only the header + used poses. The Preset struct reserves
-    // MAX_POSES_PER_PRESET (30) slots but most presets use 1-15; writing the
-    // full 1344-byte struct every call exhausts NVS's log-structured 20 KB
-    // partition, silently drops later writes, and erases pre-existing blobs.
     prefs.begin("roboarm", false);
     for (uint8_t i = 0; i < MAX_PRESETS; i++) {
         char key[4]; snprintf(key, sizeof(key), "ps%u", (unsigned)i);
-        int len = presets[i].len;
-        if (len < 0) len = 0;
-        if (len > MAX_POSES_PER_PRESET) len = MAX_POSES_PER_PRESET;
-        size_t bytes = offsetof(Preset, seq) + (size_t)len * sizeof(Pose);
-        size_t wrote = prefs.putBytes(key, &presets[i], bytes);
-        if (wrote != bytes) {
-            Serial.printf("[FLASH] Preset %u write FAILED (%u/%u bytes)\n",
-                          (unsigned)i, (unsigned)wrote, (unsigned)bytes);
-        }
+        prefs.putBytes(key, &presets[i], sizeof(Preset));
     }
     prefs.end();
     Serial.printf("[FLASH] Presets saved (%u slots)\n", (unsigned)MAX_PRESETS);
@@ -756,13 +895,10 @@ void loadPresetsFromFlash() {
             presets[2].seq[0].a[j] = oldPick[j];
             presets[3].seq[0].a[j] = oldPlace[j];
         }
-        // Only the first 4 slots (Home/Ready/Pick/Place) got a pose from the
-        // old format; Red/Yellow/Blue stay at their compile-time len=0.
-        for (uint8_t i = 0; i < 4; i++) presets[i].len = 1;
+        for (uint8_t i = 0; i < MAX_PRESETS; i++) presets[i].len = 1;
         for (uint8_t i = 0; i < MAX_PRESETS; i++) {
             char key[4]; snprintf(key, sizeof(key), "ps%u", (unsigned)i);
-            size_t bytes = offsetof(Preset, seq) + (size_t)presets[i].len * sizeof(Pose);
-            prefs.putBytes(key, &presets[i], bytes);
+            prefs.putBytes(key, &presets[i], sizeof(Preset));
         }
         prefs.remove("ph"); prefs.remove("pr");
         prefs.remove("pk"); prefs.remove("pl");
@@ -773,28 +909,7 @@ void loadPresetsFromFlash() {
     prefs.begin("roboarm", true);
     for (uint8_t i = 0; i < MAX_PRESETS; i++) {
         char key[4]; snprintf(key, sizeof(key), "ps%u", (unsigned)i);
-        if (!prefs.isKey(key)) continue;
-        // Variable-size blob: could be a legacy 1344-byte write or a new
-        // short (24 + len*44) write. Read whatever's actually there.
-        size_t stored = prefs.getBytesLength(key);
-        if (stored < offsetof(Preset, seq) || stored > sizeof(Preset)) {
-            Serial.printf("[FLASH] Preset %u corrupt size (%u), skipping\n",
-                          (unsigned)i, (unsigned)stored);
-            continue;
-        }
-        prefs.getBytes(key, &presets[i], stored);
-        int len = presets[i].len;
-        size_t expectedNew = offsetof(Preset, seq) + (size_t)len * sizeof(Pose);
-        // Accept two on-disk shapes: new short blob (24 + len*44 bytes) OR
-        // legacy full-struct blob (sizeof(Preset)=1344 bytes). Anything else
-        // is genuinely corrupt.
-        bool okNew    = (stored == expectedNew);
-        bool okLegacy = (stored == sizeof(Preset));
-        if (len < 0 || len > MAX_POSES_PER_PRESET || (!okNew && !okLegacy)) {
-            Serial.printf("[FLASH] Preset %u len=%d inconsistent with %u bytes, resetting\n",
-                          (unsigned)i, len, (unsigned)stored);
-            presets[i].len = 0;
-        }
+        if (prefs.isKey(key)) prefs.getBytes(key, &presets[i], sizeof(Preset));
     }
     prefs.end();
 
@@ -820,34 +935,7 @@ void processPlayback() {
         }
     }
 
-    if (playSrcIsFk) {
-        int s[5];
-        int usedRy = 0;
-        int* a = playSrc[playIdx].a;
-        if (!solveRecordedWaypoint(playSrc[playIdx], s, &usedRy)) {
-            Serial.printf("[%s] %d/%d \"%s\" unreachable FK=(%d,%d,%d Ry=%d Rx=%d)\n",
-                isCycling ? "CYC" : "PLAY", playIdx + 1, playSrcLen, playSrc[playIdx].label,
-                a[0], a[1], a[2], a[3], a[4]);
-            playIdx++;
-            playNextMs = millis() + PLAY_STEP_MS;
-            pendingBroadcast = true;
-            return;
-        }
-        if (usedRy != a[3]) {
-            if (usedRy == 999) {
-                Serial.printf("[%s] %d/%d \"%s\" using position-only IK\n",
-                    isCycling ? "CYC" : "PLAY", playIdx + 1, playSrcLen, playSrc[playIdx].label);
-            } else {
-                Serial.printf("[%s] %d/%d \"%s\" relaxed Ry %d -> %d\n",
-                    isCycling ? "CYC" : "PLAY", playIdx + 1, playSrcLen, playSrc[playIdx].label,
-                    a[3], usedRy);
-            }
-        }
-        for (int i = 0; i < 5; i++) setServo(i, s[i]);
-        setServo(5, a[5]);
-    } else {
-        for (int i = 0; i < 6; i++) setServo(i, playSrc[playIdx].a[i]);   // smooth ramp
-    }
+    for (int i = 0; i < 6; i++) setServo(i, playSrc[playIdx].a[i]);   // smooth ramp
     Serial.printf("[%s] %d/%d \"%s\"\n",
         isCycling ? "CYC" : "PLAY", playIdx + 1, playSrcLen, playSrc[playIdx].label);
     playIdx++;

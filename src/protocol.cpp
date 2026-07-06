@@ -7,17 +7,19 @@
 #include <WiFi.h>
 
 // ── No-heap JSON buffers
-static char statusBuf[300];
+static char statusBuf[340];
 static char posesBuf[3000];
 
 // ── JSON builders ───────────────────────────────────────────────────────────
 const char* buildStatus() {
-    Pose3D fk = computeFK();
+    // Effective frame: tip when toolMode — the UI's XYZ readout must show the
+    // same point MV/LN commands accept (the "to" flag tells the UI which).
+    Pose3D fk = computeFKEffective();
     snprintf(statusBuf, sizeof(statusBuf),
         "{\"t\":\"s\",\"j\":[%d,%d,%d,%d,%d,%d],"
         "\"m\":%u,\"l\":%d,\"p\":%d,\"c\":%d,\"i\":%d,\"r\":%d,\"b\":%u,"
         "\"x\":%ld,\"y\":%ld,\"z\":%ld,\"rx\":%ld,\"ry\":%ld,\"rz\":%ld,"
-        "\"ik\":%d,\"sp\":%d}",
+        "\"to\":%d,\"ln\":%d,\"cm\":%d}",
         joints[0].cur, joints[1].cur, joints[2].cur,
         joints[3].cur, joints[4].cur, joints[5].cur,
         (unsigned)joyMode, seqLen,
@@ -26,8 +28,7 @@ const char* buildStatus() {
         (unsigned)bootState,
         lroundf(fk.x),  lroundf(fk.y),  lroundf(fk.z),
         lroundf(fk.rx), lroundf(fk.ry), lroundf(fk.rz),
-        ikControlMode ? 1 : 0,
-        (int)lroundf(motionSpeed));
+        toolMode ? 1 : 0, lineActive ? 1 : 0, cartMode ? 1 : 0);
     return statusBuf;
 }
 
@@ -88,19 +89,23 @@ void broadcastPresets() {
 //   GT:p               goto pose (smooth ramp; no playback)
 //   PY / ST / CY       play / stop / toggle cycle of live sequence
 //   CL / SA / LD       clear / save / load live sequence
-//   ID:dx:dy:dz:dry:drx IK delta jog (-100..100 per axis)
-//   IK:[0|1]            toggle IK control mode (0=joint, 1=IK)
+//   MV:x:y:z[:ry]      IK move; 4 args → fixed Ry, 3 args → free Ry
+//   MV:x:y:z:rx:ry:rz  IK move with full RPY (Rx → wrist roll, Rz consistency-checked)
+//   LN:x:y:z[:ry]      LINE — straight-line interpolated move (free or fixed Ry)
+//   TO:0|1             tool-tip mode off / on
+//   CM:0|1             Cartesian jog mode off / on
+//   CJ:dx:dy:dz:dry    Cartesian jog axes (-100..100 each)
 #define TAG(a,b) ((uint16_t)(((a)<<8) | (b)))
 
 void processWsCmd(char* msg) {
     if (msg[0] == 0 || msg[1] == 0) return;
     uint16_t tag = TAG((uint8_t)msg[0], (uint8_t)msg[1]);
 
-    char* args[5] = { nullptr, nullptr, nullptr, nullptr, nullptr };
+    char* args[6] = { nullptr, nullptr, nullptr, nullptr, nullptr, nullptr };
     if (msg[2] == ':') {
         char* s = msg + 3;
         args[0] = s;
-        for (int i = 1; i < 5 && (s = strchr(s, ':')) != nullptr; i++) {
+        for (int i = 1; i < 6 && (s = strchr(s, ':')) != nullptr; i++) {
             *s++ = '\0';
             args[i] = s;
         }
@@ -184,24 +189,7 @@ void processWsCmd(char* msg) {
             if (!args[0]) break;
             int p = atoi(args[0]);
             if (p >= 0 && p < seqLen) {
-                int s[5];
-                int* a = seq[p].a;
-                int usedRy = 0;
-                if (solveRecordedWaypoint(seq[p], s, &usedRy)) {
-                    for (int i = 0; i < 5; i++) setServo(i, s[i]);
-                    setServo(5, a[5]);
-                    if (usedRy != a[3]) {
-                        if (usedRy == 999) {
-                            Serial.printf("[GT] Pose %d using position-only IK\n", p + 1);
-                        } else {
-                            Serial.printf("[GT] Pose %d relaxed Ry %d -> %d\n",
-                                          p + 1, a[3], usedRy);
-                        }
-                    }
-                } else {
-                    Serial.printf("[GT] Pose %d unreachable FK=(%d,%d,%d Ry=%d Rx=%d)\n",
-                                  p + 1, a[0], a[1], a[2], a[3], a[4]);
-                }
+                for (int i = 0; i < 6; i++) setServo(i, seq[p].a[i]);
                 pendingBroadcast = true;
             }
             break;
@@ -212,32 +200,60 @@ void processWsCmd(char* msg) {
         case TAG('C','L'): clearRecording(); broadcastPoses(); break;
         case TAG('S','A'): saveToFlash(); break;
         case TAG('L','D'): loadFromFlash(); broadcastPoses(); break;
-        case TAG('M','V'): {                             // MV:x:y:z[:ry]  IK move
+        case TAG('M','V'): {                             // MV:x:y:z[:ry] OR MV:x:y:z:rx:ry:rz
+            if (!args[0] || !args[1] || !args[2]) break;
+            float x = atof(args[0]);
+            float y = atof(args[1]);
+            float z = atof(args[2]);
+            if (args[3] && args[4] && args[5]) {
+                // Full RPY form: x:y:z:rx:ry:rz
+                float rx = atof(args[3]);
+                float ry = atof(args[4]);
+                float rz = atof(args[5]);
+                moveToXYZ(x, y, z, ry, /*fixed_ry=*/true, rx, rz);
+            } else if (args[3]) {
+                // Legacy 4-arg form: x:y:z:ry
+                moveToXYZ(x, y, z, atof(args[3]), /*fixed_ry=*/true);
+            } else {
+                // 3-arg form: free Ry
+                moveToXYZ(x, y, z, 0.0f, /*fixed_ry=*/false);
+            }
+            break;
+        }
+        case TAG('L','N'): {                             // LN:x:y:z[:ry]  straight-line move
             if (!args[0] || !args[1] || !args[2]) break;
             float x = atof(args[0]);
             float y = atof(args[1]);
             float z = atof(args[2]);
             bool fixed = (args[3] != nullptr);
             float ry = fixed ? atof(args[3]) : 0.0f;
-            moveToXYZ(x, y, z, ry, fixed);
+            startLine(x, y, z, ry, fixed);
             break;
         }
-        case TAG('I','D'): {                             // ID:dx:dy:dz:dry:drx  IK delta jog
-            for (int i = 0; i < 5; i++) {
-                ikWebJog[i] = (args[i] != nullptr) ? constrain(atoi(args[i]), -100, 100) : 0;
-            }
+        case TAG('T','O'): {                             // TO:0|1  tool mode
+            if (!args[0]) break;
+            toolMode = (atoi(args[0]) != 0);
+            Serial.printf("[TOOL] %s\n", toolMode ? "ON" : "OFF");
+            pendingBroadcast = true;
             break;
         }
-        case TAG('I','K'): {                             // IK:[0|1]  toggle IK control mode
-            if (args[0]) {
-                ikControlMode = (atoi(args[0]) != 0);
-                if (!ikControlMode) {
-                    for (int i = 0; i < 5; i++) ikWebJog[i] = 0;
-                    ikWebJogActive = false;
-                }
-                Serial.printf("[IK] Control mode: %s\n", ikControlMode ? "IK (XYZ)" : "Joint");
-                pendingBroadcast = true;
+        case TAG('C','M'): {                             // CM:0|1  Cartesian jog mode
+            if (!args[0]) break;
+            cartMode = (atoi(args[0]) != 0);
+            if (!cartMode) {
+                for (int i = 0; i < 4; i++) cartJog[i] = 0;
+                cartJogActive = false;
             }
+            Serial.printf("[CART] %s\n", cartMode ? "ON" : "OFF");
+            pendingBroadcast = true;
+            break;
+        }
+        case TAG('C','J'): {                             // CJ:dx:dy:dz:dry  Cartesian jog axes
+            if (!args[0] || !args[1] || !args[2] || !args[3]) break;
+            cartJog[0] = constrain(atoi(args[0]), -100, 100);
+            cartJog[1] = constrain(atoi(args[1]), -100, 100);
+            cartJog[2] = constrain(atoi(args[2]), -100, 100);
+            cartJog[3] = constrain(atoi(args[3]), -100, 100);
             break;
         }
         case TAG('S','L'): {                             // SL:v  set motion speed (deg/sec)
@@ -398,7 +414,6 @@ void onWsEvent(AsyncWebSocket*, AsyncWebSocketClient* client,
         if (client->canSend()) client->text(buildPresets());
     } else if (type == WS_EVT_DISCONNECT) {
         for (int j = 0; j < 6; j++) webJog[j] = 0;
-        for (int i = 0; i < 5; i++) ikWebJog[i] = 0;
     } else if (type == WS_EVT_DATA) {
         AwsFrameInfo* info = (AwsFrameInfo*)arg;
         if (info->final && info->index == 0 && info->len == len && info->opcode == WS_TEXT) {
@@ -431,9 +446,11 @@ static void printHelp() {
     Serial.println(F("  MOVE                show current XYZ + Rxyz"));
     Serial.println(F("  MOVE x y z          IK move (free Ry — wider reach)"));
     Serial.println(F("  MOVE x y z ry       IK move with tool pitch pinned"));
+    Serial.println(F("  MOVE x y z rx ry rz IK move with full RPY (Rx→wrist roll, Rz checked)"));
+    Serial.println(F("  LINE x y z [ry]     straight-line interpolated IK move"));
+    Serial.println(F("  TOOL [ON|OFF]       show/set tool-tip IK mode (TOOL_OFFSET=111mm)"));
     Serial.println(F("  INVERT <j>          toggle joint direction"));
     Serial.println(F("  SPEED [deg/sec]     get/set motion engine speed"));
-    Serial.println(F("  IKMODE [ON|OFF]     toggle IK control mode (XYZ vs joint jog)"));
     Serial.println(F("  TEST                lo→home→hi sweep per joint"));
     Serial.println(F("─── Calibration ───────────────────────────────────────"));
     Serial.println(F("  RAW <j> <counts>           direct PCA9685 write"));
@@ -442,9 +459,7 @@ static void printHelp() {
     Serial.println();
 }
 
-void processSerial() {
-    if (!Serial.available()) return;
-    String cmd = Serial.readStringUntil('\n');
+static void handleSerialLine(String cmd) {
     cmd.trim(); cmd.toUpperCase();
     if (cmd.length() == 0) return;
 
@@ -496,21 +511,6 @@ void processSerial() {
             setServoNow(i, joints[i].home); delay(600);
         }
         pendingBroadcast = true;
-    }
-    else if (cmd.startsWith("IKMODE")) {
-        if (cmd.length() <= 6) {
-            Serial.printf("[IK] Control mode: %s\n", ikControlMode ? "IK (XYZ)" : "Joint");
-        } else {
-            String val = cmd.substring(7);
-            val.trim(); val.toUpperCase();
-            ikControlMode = (val == "ON" || val == "1");
-            if (!ikControlMode) {
-                for (int i = 0; i < 5; i++) ikWebJog[i] = 0;
-                ikWebJogActive = false;
-            }
-            Serial.printf("[IK] Control mode: %s\n", ikControlMode ? "IK (XYZ)" : "Joint");
-            pendingBroadcast = true;
-        }
     }
     else if (cmd.startsWith("SPEED")) {
         if (cmd.length() <= 5) {
@@ -635,13 +635,35 @@ void processSerial() {
     else if (cmd == "MOVE") {
         // No args — one-shot current FK readout (force-prints even if
         // printFK's change-detector is sitting on the same values).
-        Pose3D p = computeFK();
+        Pose3D p = computeFKEffective();
         Serial.printf("X: %ld mm, Y: %ld mm, Z: %ld mm | Rx: %ld, Ry: %ld, Rz: %ld\n",
             lroundf(p.x),  lroundf(p.y),  lroundf(p.z),
             lroundf(p.rx), lroundf(p.ry), lroundf(p.rz));
     }
     else if (cmd.startsWith("MOVE ")) {
-        // 3 args → free-Ry (wider reach); 4 args → fixed-Ry (tool orientation pinned)
+        // 3 args → free-Ry; 4 args → fixed-Ry; 6 args → full RPY (x y z rx ry rz)
+        float v[6] = {0, 0, 0, 0, 0, 0};
+        int n = 0, p = 5;
+        while (n < 6) {
+            int q = cmd.indexOf(' ', p);
+            v[n++] = (q < 0 ? cmd.substring(p) : cmd.substring(p, q)).toFloat();
+            if (q < 0) break;
+            p = q + 1;
+        }
+        if (n < 3) {
+            Serial.println("Usage: MOVE x y z [ry]   or   MOVE x y z rx ry rz");
+        } else if (n == 3) {
+            moveToXYZ(v[0], v[1], v[2], 0.0f, /*fixed_ry=*/false);
+        } else if (n == 4) {
+            moveToXYZ(v[0], v[1], v[2], v[3], /*fixed_ry=*/true);
+        } else if (n == 6) {
+            moveToXYZ(v[0], v[1], v[2], v[4], /*fixed_ry=*/true, v[3], v[5]);
+        } else {
+            Serial.println("Usage: MOVE x y z [ry]   or   MOVE x y z rx ry rz");
+        }
+    }
+    else if (cmd.startsWith("LINE ")) {
+        // LINE x y z [ry]  — straight-line interpolated move
         float v[4] = {0, 0, 0, 0};
         int n = 0, p = 5;
         while (n < 4) {
@@ -650,10 +672,19 @@ void processSerial() {
             if (q < 0) break;
             p = q + 1;
         }
-        if (n < 3) {
-            Serial.println("Usage: MOVE <x> <y> <z> [ry]   (4th arg = pin tool pitch)");
+        if (n < 3) Serial.println("Usage: LINE x y z [ry]");
+        else       startLine(v[0], v[1], v[2], v[3], /*fixed_ry=*/ n >= 4);
+    }
+    else if (cmd.startsWith("TOOL")) {
+        if (cmd.length() <= 4) {
+            Serial.printf("[TOOL] mode = %s (offset = %.0f mm)\n",
+                          toolMode ? "ON" : "OFF", 111.0f);
         } else {
-            moveToXYZ(v[0], v[1], v[2], v[3], /*fixed_ry=*/ n >= 4);
+            String arg = cmd.substring(5); arg.trim();
+            if      (arg == "ON")  { toolMode = true;  Serial.println("[TOOL] ON");  }
+            else if (arg == "OFF") { toolMode = false; Serial.println("[TOOL] OFF"); }
+            else Serial.println("Usage: TOOL [ON|OFF]");
+            pendingBroadcast = true;
         }
     }
     else if (cmd == "HELP") printHelp();
@@ -671,5 +702,26 @@ void processSerial() {
     else {
         Serial.printf("Unknown: '%s'\n", cmd.c_str());
         printHelp();
+    }
+}
+
+// Non-blocking line reader. The old readStringUntil('\n') blocked loop() for
+// up to 1 s (the Stream default timeout) whenever bytes arrived without a
+// newline — e.g. a monitor sending char-by-char — freezing the motion engine
+// mid-keystroke. Accumulate here, dispatch only on a complete line.
+void processSerial() {
+    static char   lineBuf[96];
+    static size_t n = 0;
+    while (Serial.available()) {
+        char c = (char)Serial.read();
+        if (c == '\n' || c == '\r') {
+            if (n > 0) {
+                lineBuf[n] = '\0';
+                n = 0;
+                handleSerialLine(String(lineBuf));
+            }
+        } else if (n < sizeof(lineBuf) - 1) {
+            lineBuf[n++] = c;
+        }
     }
 }

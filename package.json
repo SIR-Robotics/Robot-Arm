@@ -1,0 +1,13 @@
+{
+  "name": "roboarm-tests",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Playwright E2E tests for RoboArm IK web UI",
+  "scripts": {
+    "test": "npx playwright test",
+    "test:ik": "npx playwright test tests/ik-controls.spec.ts"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.52.0"
+  }
+}
