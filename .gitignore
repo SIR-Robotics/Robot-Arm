@@ -11,3 +11,5 @@ skills-lock.json
 docs
 test
 
+.env*
+
