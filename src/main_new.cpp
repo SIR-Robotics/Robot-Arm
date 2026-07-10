@@ -161,7 +161,6 @@ void loop() {
     if (bootState != STATE_FAULT) {
         processJoystick();
         processWebJog();
-        processIkWebJog();
         processButtons();
         processPlayback();
         processPresetMove();  // advances staged preset moves between phases
@@ -186,12 +185,11 @@ void loop() {
         lastCleanupMs = millis();
     }
 
-    if ((pendingBroadcast || joyActive || webJogActive || ikJogActive || ikWebJogActive)
+    if ((pendingBroadcast || joyActive || webJogActive)
         && millis() - lastBroadMs >= 50) {
         broadcastStatus();
         lastBroadMs      = millis();
         pendingBroadcast = false;
-        ikJogActive      = false;
     }
 
     if (millis() - lastFkMs >= 500) {

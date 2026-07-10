@@ -107,9 +107,6 @@ Inbound messages use a zero-allocation `TAG:arg:arg` text format (no JSON parsin
 | `CL` | — | Clear all poses |
 | `SA` | — | Save poses to flash |
 | `LD` | — | Load poses from flash |
-| `MV` | x, y, z[, ry] | IK move, optionally fixed pitch |
-| `ID` | dx, dy, dz, dry, drx | IK jog input (−100..100 per axis) |
-| `IK` | 0 or 1 | Toggle IK control mode |
 
 Outbound JSON uses three message types: `{"t":"s",...}` for status, `{"t":"p",...}` for the live pose list, and `{"t":"pl",...}` for preset names/lengths. They are built with `snprintf` into static buffers — no heap allocation on the hot path.
 

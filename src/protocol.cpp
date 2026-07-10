@@ -18,7 +18,7 @@ const char* buildStatus() {
         "{\"t\":\"s\",\"j\":[%d,%d,%d,%d,%d,%d],"
         "\"m\":%u,\"l\":%d,\"p\":%d,\"c\":%d,\"i\":%d,\"r\":%d,\"b\":%u,"
         "\"x\":%ld,\"y\":%ld,\"z\":%ld,\"rx\":%ld,\"ry\":%ld,\"rz\":%ld,"
-        "\"ik\":%d,\"tg\":%d}",
+        "\"tg\":%d}",
         joints[0].cur, joints[1].cur, joints[2].cur,
         joints[3].cur, joints[4].cur, joints[5].cur,
         (unsigned)joyMode, seqLen,
@@ -27,7 +27,6 @@ const char* buildStatus() {
         (unsigned)bootState,
         lroundf(fk.x),  lroundf(fk.y),  lroundf(fk.z),
         lroundf(fk.rx), lroundf(fk.ry), lroundf(fk.rz),
-        ikControlMode ? 1 : 0,
         visionCurrentTag());   // -1 = none; ID otherwise (HuskyLens tag)
     return statusBuf;
 }
@@ -89,8 +88,6 @@ void broadcastPresets() {
 //   GT:p               goto pose (smooth ramp; no playback)
 //   PY / ST / CY       play / stop / toggle cycle of live sequence
 //   CL / SA / LD       clear / save / load live sequence
-//   ID:dx:dy:dz:dry:drx IK delta jog (-100..100 per axis)
-//   IK:[0|1]            toggle IK control mode (0=joint, 1=IK)
 #define TAG(a,b) ((uint16_t)(((a)<<8) | (b)))
 
 void processWsCmd(char* msg) {
@@ -185,24 +182,10 @@ void processWsCmd(char* msg) {
             if (!args[0]) break;
             int p = atoi(args[0]);
             if (p >= 0 && p < seqLen) {
-                int s[5];
                 int* a = seq[p].a;
-                int usedRy = 0;
-                if (solveRecordedWaypoint(seq[p], s, &usedRy)) {
-                    for (int i = 0; i < 5; i++) setServo(i, s[i]);
-                    setServo(5, a[5]);
-                    if (usedRy != a[3]) {
-                        if (usedRy == 999) {
-                            Serial.printf("[GT] Pose %d using position-only IK\n", p + 1);
-                        } else {
-                            Serial.printf("[GT] Pose %d relaxed Ry %d -> %d\n",
-                                          p + 1, a[3], usedRy);
-                        }
-                    }
-                } else {
-                    Serial.printf("[GT] Pose %d unreachable FK=(%d,%d,%d Ry=%d Rx=%d)\n",
-                                  p + 1, a[0], a[1], a[2], a[3], a[4]);
-                }
+                for (int i = 0; i < 6; i++) setServo(i, a[i]);
+                Serial.printf("[GT] Pose %d -> J=(%d,%d,%d,%d,%d,%d)\n",
+                              p + 1, a[0], a[1], a[2], a[3], a[4], a[5]);
                 pendingBroadcast = true;
             }
             break;
@@ -213,34 +196,6 @@ void processWsCmd(char* msg) {
         case TAG('C','L'): clearRecording(); broadcastPoses(); break;
         case TAG('S','A'): saveToFlash(); break;
         case TAG('L','D'): loadFromFlash(); broadcastPoses(); break;
-        case TAG('M','V'): {                             // MV:x:y:z[:ry]  IK move
-            if (!args[0] || !args[1] || !args[2]) break;
-            float x = atof(args[0]);
-            float y = atof(args[1]);
-            float z = atof(args[2]);
-            bool fixed = (args[3] != nullptr);
-            float ry = fixed ? atof(args[3]) : 0.0f;
-            moveToXYZ(x, y, z, ry, fixed);
-            break;
-        }
-        case TAG('I','D'): {                             // ID:dx:dy:dz:dry:drx  IK delta jog
-            for (int i = 0; i < 5; i++) {
-                ikWebJog[i] = (args[i] != nullptr) ? constrain(atoi(args[i]), -100, 100) : 0;
-            }
-            break;
-        }
-        case TAG('I','K'): {                             // IK:[0|1]  toggle IK control mode
-            if (args[0]) {
-                ikControlMode = (atoi(args[0]) != 0);
-                if (!ikControlMode) {
-                    for (int i = 0; i < 5; i++) ikWebJog[i] = 0;
-                    ikWebJogActive = false;
-                }
-                Serial.printf("[IK] Control mode: %s\n", ikControlMode ? "IK (XYZ)" : "Joint");
-                pendingBroadcast = true;
-            }
-            break;
-        }
     }
 }
 
@@ -376,7 +331,6 @@ void onWsEvent(AsyncWebSocket*, AsyncWebSocketClient* client,
         if (client->canSend()) client->text(buildPresets());
     } else if (type == WS_EVT_DISCONNECT) {
         for (int j = 0; j < 6; j++) webJog[j] = 0;
-        for (int i = 0; i < 5; i++) ikWebJog[i] = 0;
     } else if (type == WS_EVT_DATA) {
         AwsFrameInfo* info = (AwsFrameInfo*)arg;
         if (info->final && info->index == 0 && info->len == len && info->opcode == WS_TEXT) {
@@ -407,11 +361,8 @@ static void printHelp() {
     Serial.println(F("  RENAME <0-6> <nm>   rename a preset (UPPERCASE)"));
     Serial.println(F("  S <j> <a>           set joint j to angle a (smooth)"));
     Serial.println(F("  MOVE                show current XYZ + Rxyz"));
-    Serial.println(F("  MOVE x y z          IK move (free Ry — wider reach)"));
-    Serial.println(F("  MOVE x y z ry       IK move with tool pitch pinned"));
     Serial.println(F("  INVERT <j>          toggle joint direction"));
     Serial.println(F("  SPEED [deg/sec]     get/set motion engine speed"));
-    Serial.println(F("  IKMODE [ON|OFF]     toggle IK control mode (XYZ vs joint jog)"));
     Serial.println(F("  TEST                lo→home→hi sweep per joint"));
     Serial.println(F("─── Calibration ───────────────────────────────────────"));
     Serial.println(F("  RAW <j> <counts>           direct PCA9685 write"));
@@ -474,21 +425,6 @@ void processSerial() {
             setServoNow(i, joints[i].home); delay(600);
         }
         pendingBroadcast = true;
-    }
-    else if (cmd.startsWith("IKMODE")) {
-        if (cmd.length() <= 6) {
-            Serial.printf("[IK] Control mode: %s\n", ikControlMode ? "IK (XYZ)" : "Joint");
-        } else {
-            String val = cmd.substring(7);
-            val.trim(); val.toUpperCase();
-            ikControlMode = (val == "ON" || val == "1");
-            if (!ikControlMode) {
-                for (int i = 0; i < 5; i++) ikWebJog[i] = 0;
-                ikWebJogActive = false;
-            }
-            Serial.printf("[IK] Control mode: %s\n", ikControlMode ? "IK (XYZ)" : "Joint");
-            pendingBroadcast = true;
-        }
     }
     else if (cmd.startsWith("SPEED")) {
         if (cmd.length() <= 5) {
@@ -617,22 +553,6 @@ void processSerial() {
         Serial.printf("X: %ld mm, Y: %ld mm, Z: %ld mm | Rx: %ld, Ry: %ld, Rz: %ld\n",
             lroundf(p.x),  lroundf(p.y),  lroundf(p.z),
             lroundf(p.rx), lroundf(p.ry), lroundf(p.rz));
-    }
-    else if (cmd.startsWith("MOVE ")) {
-        // 3 args → free-Ry (wider reach); 4 args → fixed-Ry (tool orientation pinned)
-        float v[4] = {0, 0, 0, 0};
-        int n = 0, p = 5;
-        while (n < 4) {
-            int q = cmd.indexOf(' ', p);
-            v[n++] = (q < 0 ? cmd.substring(p) : cmd.substring(p, q)).toFloat();
-            if (q < 0) break;
-            p = q + 1;
-        }
-        if (n < 3) {
-            Serial.println("Usage: MOVE <x> <y> <z> [ry]   (4th arg = pin tool pitch)");
-        } else {
-            moveToXYZ(v[0], v[1], v[2], v[3], /*fixed_ry=*/ n >= 4);
-        }
     }
     else if (cmd == "HELP") printHelp();
     else if (cmd == "RED")    runRed();

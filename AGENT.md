@@ -23,7 +23,7 @@ In the current code, `src/vision.cpp` maps tag IDs to colors and triggers the sa
 
 ## Control Context
 
-- Web UI and WebSocket commands control manual jog, presets, recording, playback, and IK.
+- Web UI and WebSocket commands control manual jog, presets, recording, and playback.
 - HTTP routes `/api/run/red`, `/api/run/yellow`, and `/api/run/blue` execute the stored color presets.
 - Tag detection should call the existing preset trigger path, not duplicate arm movement logic.
 
