@@ -8,14 +8,13 @@ extern Joint  joints[6];
 // Smooth motion state
 extern float  servoCur[6];              // physical position, advanced by processMotion
 extern float  servoTarget[6];           // desired position — set by joystick/web/preset/playback
-extern float  motionSpeed;              // deg/sec, tunable via SPEED serial command
+extern float  motionSpeed;              // deg/sec, defaults to MOTION_SPEED_DEG_S
 
 extern Pose   seq[MAX_POSES];
 extern int    seqLen;
 extern bool   isPlaying;
 extern bool   isCycling;
 extern int    playIdx;
-extern uint32_t playNextMs;
 
 // Playback source — points at seq[] (live recording) or presets[i].seq.
 // Set by startPlayback / startCycle / playPreset before kicking the engine.

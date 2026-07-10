@@ -33,9 +33,10 @@
 
 // ── Recording
 #define MAX_POSES    50
-#define PLAY_STEP_MS 3000       // 3s/pose, enough for 120° move at 40°/s
 
 // ── Staged motion (soft-home + preset moves)
+#define MOTION_SPEED_DEG_S   30.0f  // default playback/jog speed; edit + reflash to hardcode speed
+#define PLAY_PAUSE_MS        1000   // wait after each playback waypoint reaches target
 #define SOFT_HOME_STEP_MS    25     // ms per 1° step during boot ramp = 40°/s
 #define SOFT_HOME_SETTLE_MS  600    // pause AFTER each joint finishes its ramp
 #define PRESET_SPEED_DEG_S   40.0f  // motionSpeed override while a preset is staging

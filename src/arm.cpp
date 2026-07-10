@@ -45,7 +45,7 @@ Joint joints[6] = {
 // ── Smooth motion state
 float servoCur[6]    = {129, 62, 86, 86, 86, 0};
 float servoTarget[6] = {129, 62, 86, 86, 86, 0};
-float motionSpeed    = 40.0f;         // deg/sec — ~2.25s for a 90° move (matches preset speed)
+float motionSpeed    = MOTION_SPEED_DEG_S;  // deg/sec
 
 // ── Recording state
 Pose     seq[MAX_POSES];
@@ -53,7 +53,8 @@ int      seqLen     = 0;
 bool     isPlaying  = false;
 bool     isCycling  = false;
 int      playIdx    = 0;
-uint32_t playNextMs = 0;
+static bool playWaitingForTarget = false;
+static uint32_t playPauseUntil = 0;
 
 Pose* playSrc    = nullptr;
 int   playSrcLen = 0;
@@ -368,24 +369,26 @@ void startPlayback() {
     if (!seqLen) { Serial.println("[PLAY] Empty"); return; }
     playSrc = seq; playSrcLen = seqLen;
     isCycling = false; isPlaying = true;
-    playIdx = 0; playNextMs = millis();
+    playIdx = 0; playWaitingForTarget = false; playPauseUntil = 0;
     pendingBroadcast = true;
 }
 
-void stopPlayback() { isPlaying = false; isCycling = false; pendingBroadcast = true; }
+void stopPlayback() {
+    isPlaying = false; isCycling = false; playWaitingForTarget = false; playPauseUntil = 0; pendingBroadcast = true;
+}
 
 void startCycle() {
     if (!seqLen) { Serial.println("[CYCLE] Empty"); return; }
     playSrc = seq; playSrcLen = seqLen;
     isPlaying = false; isCycling = true;
-    playIdx = 0; playNextMs = millis();
+    playIdx = 0; playWaitingForTarget = false; playPauseUntil = 0;
     pendingBroadcast = true;
 }
 
-void stopCycle() { isCycling = false; pendingBroadcast = true; }
+void stopCycle() { isCycling = false; playWaitingForTarget = false; playPauseUntil = 0; pendingBroadcast = true; }
 
 void clearRecording() {
-    seqLen = 0; isPlaying = false; isCycling = false; pendingBroadcast = true;
+    seqLen = 0; isPlaying = false; isCycling = false; playWaitingForTarget = false; playPauseUntil = 0; pendingBroadcast = true;
     Serial.println("[REC] Cleared");
 }
 
@@ -442,7 +445,7 @@ void playPreset(uint8_t idx) {
         playSrc = presets[idx].seq;
         playSrcLen = presets[idx].len;
         isCycling = false; isPlaying = true;
-        playIdx = 0; playNextMs = millis();
+        playIdx = 0; playWaitingForTarget = false; playPauseUntil = 0;
         pendingBroadcast = true;
         Serial.printf("[PRESET %u \"%s\"] playing %d poses\n",
                       (unsigned)idx, presets[idx].name, presets[idx].len);
@@ -504,11 +507,27 @@ void loadPresetsFromFlash() {
 }
 
 // ── Playback ────────────────────────────────────────────────────────────────
+static bool playbackTargetReached() {
+    for (int i = 0; i < 6; i++) {
+        if (fabsf(servoTarget[i] - servoCur[i]) > PRESET_SETTLE_DEG) return false;
+    }
+    return true;
+}
+
 void processPlayback() {
     if (!isPlaying && !isCycling) return;
-    if (millis() < playNextMs)    return;
     if (!playSrc || playSrcLen == 0) {
-        isPlaying = false; isCycling = false; return;
+        isPlaying = false; isCycling = false; playWaitingForTarget = false; playPauseUntil = 0; return;
+    }
+    if (playWaitingForTarget) {
+        if (!playbackTargetReached()) return;
+        playWaitingForTarget = false;
+        playPauseUntil = millis() + PLAY_PAUSE_MS;
+        return;
+    }
+    if (playPauseUntil != 0) {
+        if (millis() < playPauseUntil) return;
+        playPauseUntil = 0;
     }
 
     if (playIdx >= playSrcLen) {
@@ -522,9 +541,9 @@ void processPlayback() {
     }
 
     for (int i = 0; i < 6; i++) setServo(i, playSrc[playIdx].a[i]);   // smooth ramp
+    playWaitingForTarget = true;
     Serial.printf("[%s] %d/%d \"%s\"\n",
         isCycling ? "CYC" : "PLAY", playIdx + 1, playSrcLen, playSrc[playIdx].label);
     playIdx++;
-    playNextMs = millis() + PLAY_STEP_MS;
     pendingBroadcast = true;
 }
