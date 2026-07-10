@@ -71,7 +71,7 @@ button.amb.on{background:linear-gradient(180deg,#e6a817,#c08810);color:#111;bord
 .kbd kbd{background:#0a1428;border:1px solid #2a3a5e;border-radius:3px;padding:1px 5px;margin:0 1px;font-family:Consolas,monospace;color:var(--ac3)}
 @media(max-width:520px){.jr{grid-template-columns:repeat(3,1fr)}.jc .v{font-size:.95rem}.spad{max-width:180px}}
 </style></head><body>
-<div class=hud><span class=dot id=dt></span><span class=tt>ROBOARM</span><span class=gap></span><button id=ikBtn class=pill style="cursor:pointer;border:none;font-size:.7rem;padding:3px 8px;border-radius:10px;background:var(--p2);color:var(--mu)" onclick=toggleIK() title="Toggle IK control mode">JOINT</button><span class=pill id=fsm style="color:#fff;background:#444;font-weight:700">--</span><span class=pill id=ip>--</span><span class=pill>RSSI <b id=rs>--</b></span><span class=pill id=gpd style=display:none>&#127918; <b>GP</b></span></div>
+<div class=hud><span class=dot id=dt></span><span class=tt>ROBOARM</span><span class=gap></span><span class=pill id=fsm style="color:#fff;background:#444;font-weight:700">--</span><span class=pill id=ip>--</span><span class=pill>RSSI <b id=rs>--</b></span><span class=pill id=tagp title="HuskyLens tag ID">&#127991; TAG <b id=tagv>&mdash;</b></span><span class=pill id=gpd style=display:none>&#127918; <b>GP</b></span></div>
 <div class=jr id=jr></div>
 <div class=pad>
  <div class=stk><div class=ttl id=sLt>LEFT STICK</div><div class=sub id=sLs>BASE / SHOULDER</div><div class=spad id=sL data-jx=0 data-jy=1><div class=knob></div></div><div class=kbd id=sLk><kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd></div></div>
@@ -83,16 +83,6 @@ button.amb.on{background:linear-gradient(180deg,#e6a817,#c08810);color:#111;bord
 </div>
 <div class=p><h2>FK Position</h2><div id=fk style="font-family:Consolas,monospace;font-size:.82rem;color:var(--ac3);text-align:center;letter-spacing:.4px">--</div></div>
 <div class=p><h2>Fine Jog</h2><div id=fjp></div></div>
-<div class=p><h2>IK Move</h2>
- <div style="display:grid;grid-template-columns:repeat(4,1fr) 70px;gap:6px;align-items:center;margin-bottom:7px">
-  <input id=mvx type=number placeholder=X step=1 class=ri style="width:auto">
-  <input id=mvy type=number placeholder=Y step=1 class=ri style="width:auto">
-  <input id=mvz type=number placeholder=Z step=1 class=ri style="width:auto">
-  <input id=mvr type=number placeholder=Ry step=1 class=ri style="width:auto">
-  <button class=grn onclick=mv()>GO</button>
- </div>
- <div class=kbd>Ry empty = free wrist pitch (wider reach)</div>
-</div>
 <div class=p><h2>Presets</h2><div class=g4 id=psg></div><div class=kbd style=margin-top:7px>Tap card to run &mdash; tap name to rename &mdash; long-press to save current pose</div></div>
 <div class=p><h2>Recording <span class=bd id=rc>0</span></h2>
  <div class=g4 style=margin-bottom:7px>
@@ -118,31 +108,8 @@ button.amb.on{background:linear-gradient(180deg,#e6a817,#c08810);color:#111;bord
 <div id=toast></div>
 <script>
 const JD=[{n:'BASE',k:'B',mn:0,mx:180,hm:90},{n:'SHOULDER',k:'S',mn:30,mx:150,hm:90},{n:'ELBOW',k:'E',mn:0,mx:135,hm:90},{n:'WRIST P',k:'WP',mn:0,mx:180,hm:90},{n:'WRIST R',k:'WR',mn:0,mx:180,hm:90},{n:'GRIPPER',k:'G',mn:0,mx:90,hm:45}];
-const FKD=['X','Y','Z','Ry','Rx','G'];
-let ps=[],s,rT,lastA=[90,90,90,90,90,45],lastPlayIdx=-1,ikMode=false;
-let ikD=[0,0,0,0,0],likD=[0,0,0,0,0];  // IK deltas + last-sent for dedup
-
-function toggleIK(){
- ikMode=!ikMode;
- ikD=[0,0,0,0,0];likD=[0,0,0,0,0];
- w(ikMode?'IK:1':'IK:0');
- updateStickLabels();
-}
-function updateStickLabels(){
- const E=ikMode?'IK MODE':'JOINT MODE';
- document.getElementById('ikBtn').textContent=E;
- document.getElementById('ikBtn').style.color=ikMode?'#27ae60':'var(--mu)';
- document.getElementById('ikBtn').style.background=ikMode?'#0f3a1a':'var(--p2)';
- document.getElementById('sLs').textContent=ikMode?'X / Y (world)':'BASE / SHOULDER';
- document.getElementById('sRs').textContent=ikMode?'Z / Ry (pitch)':'ELBOW / WRIST P.';
- document.getElementById('sLk').innerHTML=ikMode?'<kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd>':'<kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd>';
- document.getElementById('sRk').innerHTML=ikMode?'<kbd>K</kbd><kbd>J</kbd><kbd>I</kbd><kbd>L</kbd>':'<kbd>I</kbd><kbd>J</kbd><kbd>K</kbd><kbd>L</kbd>';
-}
-function sendIkDeltas(){
- let ch=false;
- for(let i=0;i<5;i++){if(ikD[i]!==likD[i])ch=true;likD[i]=ikD[i]}
- if(ch)w('ID:'+ikD.join(':'));
-}
+const FKD=['B','S','E','WP','WR','G'];
+let ps=[],s,rT,lastA=[90,90,90,90,90,45],lastPlayIdx=-1;
 let pst=[{n:'Home',l:1},{n:'Ready',l:1},{n:'Pick',l:1},{n:'Place',l:1}];
 
 // Joint chips — click to manually set angle (server clamps to joint limits)
@@ -178,7 +145,7 @@ function cn(){
  s.onopen=()=>{sd(1);tt('Connected');clearTimeout(rT)};
  s.onclose=()=>{sd(0);tt('Disconnected');rT=setTimeout(cn,2500)};
  s.onerror=()=>s.close();
- s.onmessage=(e)=>{const d=JSON.parse(e.data);if(d.t==='s')aS(d);else if(d.t==='p')aP(d);else if(d.t==='pl')aL(d)};
+ s.onmessage=(e)=>{const d=JSON.parse(e.data);if(d.t==='s')aS(d);else if(d.t==='p')aP(d);else if(d.t==='pl')aL(d);else if(d.t==='n')tt((d.src==='vision'?'🏷️ ':'🤖 ')+(d.msg||'event'))};
 }
 function w(x){if(s&&s.readyState===1)s.send(x)}
 function sd(o){const d=document.getElementById('dt');d.classList.toggle('ok',!!o);d.classList.toggle('err',!o)}
@@ -200,6 +167,16 @@ function aS(d){
  const cb=document.getElementById('bc');cb.classList.toggle('on',!!d.c);
  cb.innerHTML=d.c?'■ CYCLE LOOP &mdash; ON':'&#9654;&#9654; CYCLE LOOP &mdash; OFF';
  if(typeof d.r==='number')document.getElementById('rs').textContent=d.r+' dBm';
+ if(typeof d.tg==='number'){
+  // HuskyLens tag indicator: green + ID while a tag is in view, dim dash
+  // when none (firmware clears to -1 after 2s without a sighting)
+  const tp=document.getElementById('tagp'),tv=document.getElementById('tagv');
+  const seen=d.tg>=0;
+  tv.innerHTML=seen?d.tg:'&mdash;';
+  tp.style.color=seen?'#27ae60':'';
+  tv.style.color=seen?'#27ae60':'';
+  tp.style.borderColor=seen?'#27ae60':'';
+ }
  if(typeof d.x==='number'){
   document.getElementById('fk').textContent=`X: ${d.x} mm   Y: ${d.y} mm   Z: ${d.z} mm   |   Rx: ${d.rx}°   Ry: ${d.ry}°   Rz: ${d.rz}°`;
  }
@@ -214,7 +191,6 @@ function aS(d){
 if(d.c||d.p){
    if(d.i!==lastPlayIdx){lastPlayIdx=d.i;document.querySelectorAll('.pi').forEach((p,k)=>p.classList.toggle('cur',k===d.i-1))}
   } else if(lastPlayIdx!==-1){lastPlayIdx=-1;document.querySelectorAll('.pi').forEach(p=>p.classList.remove('cur'))}
-  if(typeof d.ik==='number'&&!!d.ik!==ikMode){ikMode=!!d.ik;updateStickLabels()}
 }
 function aP(d){ps=d.i||[];document.getElementById('rc').textContent=d.c;rP()}
 function eh(x){return x.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/"/g,'&quot;')}
@@ -222,7 +198,7 @@ function rP(){
  const e=document.getElementById('pls');e.innerHTML='';
  ps.forEach((p,i)=>{
   const d=document.createElement('div');d.className='pi';
-  d.innerHTML=`<span class=pnn>#${i+1}</span><span class=pll id=pl${i}>${eh(p.n)}</span><span class=pa title="Go to FK pose">${p.a.map((v,k)=>FKD[k]+v).join(' ')}</span>`;
+  d.innerHTML=`<span class=pnn>#${i+1}</span><span class=pll id=pl${i}>${eh(p.n)}</span><span class=pa title="Go to pose">${p.a.map((v,k)=>FKD[k]+v).join(' ')}</span>`;
   d.querySelector('.pll').onclick=()=>sR(i);
   d.querySelector('.pa').onclick=()=>{w('GT:'+i);tt('Go #'+(i+1))};
   e.appendChild(d);
@@ -352,40 +328,18 @@ function tick(){
  const kx=(keys.a?1:0)-(keys.d?1:0), ky=(keys.w?1:0)-(keys.s?1:0);
  const rx=(keys.l?1:0)-(keys.j?1:0), ry=(keys.k?1:0)-(keys.i?1:0);
  const tk=(keys.e?1:0)-(keys.q?1:0), tgk=(keys.x?1:0)-(keys.z?1:0);
- if(ikMode){
-  // IK mode: left=X/Y, right=Z/Ry, roll=Rx, gripper still direct
-  const sx1=sticks[0], sx2=sticks[1], dx1=sx1.dx||0, dy1=sx1.dy||0, dx2=sx2.dx||0, dy2=sx2.dy||0;
-  const gx1=sx1.gpx||0, gy1=sx1.gpy||0, gx2=sx2.gpx||0, gy2=sx2.gpy||0;
-  const t0k=trigs[0].kb||0, t0g=trigs[0].gp||0;
-  const t0d=trigs[0].dy!==undefined?trigs[0].dy:0;
-  // Drag overrides keyboard; gamepad overrides both
-  const lx=-(dx1!==0?dx1:(gx1!==0?gx1:kx));
-  const ly=-(dy1!==0?dy1:(gy1!==0?-gy1:ky));
-  const lz=(dx2!==0?dx2:(gx2!==0?gx2:rx));
-  const lry=(dy2!==0?-dy2:(gy2!==0?gy2:ry));
-  const lrx=t0d!==0?t0d:(t0g!==0?t0g:tk);
-  ikD=[Math.round(lx*100),Math.round(ly*100),Math.round(lz*100),Math.round(lry*100),Math.round(lrx*100)];
-  sendIkDeltas();
-  // Gripper stays direct
-  trigs[1].kb=tgk;
-  const tv1=(trigs[1].dy!==undefined)?trigs[1].dy:(trigs[1].kb||trigs[1].gp);
-  const tv=Math.round(tv1*100);
-  if(tv!==trigs[1].lv){trigs[1].lv=tv;w('JG:'+trigs[1].j+':'+tv)}
- } else {
-  // Joint mode (original)
-  sticks[0].kbx=kx;sticks[0].kby=ky;
-  sticks[1].kbx=rx;sticks[1].kby=ry;
-  trigs[0].kb=tk;trigs[1].kb=tgk;
-  sticks.forEach(s=>{
-   s.compose();
-   if(s.vx!==s.lvx||s.vy!==s.lvy){s.send();s.lvx=s.vx;s.lvy=s.vy}
-  });
-  trigs.forEach(t=>{
-   if(!t.dragging)t.dy=undefined;
-   t.pos();
-   if(t.v!==t.lv){t.send();t.lv=t.v}
-  });
- }
+ sticks[0].kbx=kx;sticks[0].kby=ky;
+ sticks[1].kbx=rx;sticks[1].kby=ry;
+ trigs[0].kb=tk;trigs[1].kb=tgk;
+ sticks.forEach(s=>{
+  s.compose();
+  if(s.vx!==s.lvx||s.vy!==s.lvy){s.send();s.lvx=s.vx;s.lvy=s.vy}
+ });
+ trigs.forEach(t=>{
+  if(!t.dragging)t.dy=undefined;
+  t.pos();
+  if(t.v!==t.lv){t.send();t.lv=t.v}
+ });
 }
 setInterval(tick,50);
 
@@ -496,16 +450,6 @@ JD.forEach((j,i)=>{
 // Optimistic local update so rapid clicks accumulate before the server's
 // next status broadcast (server will reconcile on its broadcast tick).
 function nj(i,d){lastA[i]+=d;const a=lastA[i];w('SV:'+i+':'+a);document.getElementById('v'+i).textContent=a+'°';const fv=document.getElementById('fv'+i);if(fv)fv.textContent=a+'°';tt(JD[i].k+' '+(d>0?'+':'')+d+' → '+a+'°')}
-
-// ── IK MOVE submit ───────────────────────────────────────────────────────
-function mv(){
- const x=+document.getElementById('mvx').value||0;
- const y=+document.getElementById('mvy').value||0;
- const z=+document.getElementById('mvz').value||0;
- const rv=document.getElementById('mvr').value.trim();
- if(rv){w('MV:'+x+':'+y+':'+z+':'+rv);tt('IK '+x+','+y+','+z+' Ry='+rv)}
- else{w('MV:'+x+':'+y+':'+z);tt('IK '+x+','+y+','+z+' free Ry')}
-}
 
 cn();
 </script></body></html>)raw";

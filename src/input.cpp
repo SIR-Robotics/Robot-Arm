@@ -20,11 +20,6 @@ int      webJog[6]    = {0,0,0,0,0,0};
 uint32_t lastWebJogMs = 0;
 bool     webJogActive = false;
 
-// IK-mode web jog: browser sends ID:dx:dy:dz:dry:drx, processed here
-int      ikWebJog[5]    = {0,0,0,0,0};
-uint32_t lastIkWebJogMs = 0;
-bool     ikWebJogActive  = false;
-
 // ── Button debounce timers
 static uint32_t lastSW = 0, lastRec = 0, lastPlay = 0, lastClr = 0, lastCycle = 0;
 
@@ -62,17 +57,6 @@ void processJoystick() {
         xD = (xRaw - joyXCenter) / (float)joyXCenter * JOY_SPEED;
     if (abs(yRaw - joyYCenter) > JOY_DEADZONE)
         yD = (yRaw - joyYCenter) / (float)joyYCenter * JOY_SPEED;
-
-    if (ikControlMode) {
-        // IK mode: left stick = X/Y, right stick = Z/Ry
-        joyActive = (xD != 0.0f || yD != 0.0f);
-        if (joyActive) {
-            float dx =  xD * (IK_JOG_SPEED_XY / JOY_SPEED);  // scale from deg→mm
-            float dy =  yD * (IK_JOG_SPEED_XY / JOY_SPEED);
-            ikJogDelta(dx, dy, 0.0f, 0.0f, 0.0f);
-        }
-        return;
-    }
 
     uint8_t jA = PAIR[joyMode][0];
     uint8_t jB = PAIR[joyMode][1];
@@ -119,25 +103,4 @@ void processWebJog() {
                                    (float)joints[j].lo, (float)joints[j].hi);
     }
     webJogActive = anyActive;
-}
-
-void processIkWebJog() {
-    if (isPlaying || isCycling || presetActive) { ikWebJogActive = false; return; }
-    if (millis() - lastIkWebJogMs < WEB_JOG_INTERVAL) return;
-    lastIkWebJogMs = millis();
-
-    bool anyActive = false;
-    float dx = 0, dy = 0, dz = 0, dry = 0, drx = 0;
-    for (int i = 0; i < 5; i++) {
-        if (ikWebJog[i] == 0) continue;
-        anyActive = true;
-        float v = ikWebJog[i] / 100.0f;
-        if (i == 0) dx  = v * IK_JOG_SPEED_XY;
-        if (i == 1) dy  = v * IK_JOG_SPEED_XY;
-        if (i == 2) dz  = v * IK_JOG_SPEED_Z;
-        if (i == 3) dry = v * IK_JOG_SPEED_RY;
-        if (i == 4) drx = v * IK_JOG_SPEED_RX;
-    }
-    if (anyActive) ikJogDelta(dx, dy, dz, dry, drx);
-    ikWebJogActive = anyActive;
 }

@@ -10,7 +10,7 @@
 //   web_ui.h/cpp ─ HTML/CSS/JS payload
 //
 // To switch back to the single-file build, see git tag `pre-segmentation`.
-
+#include "vision.h"
 #include <Arduino.h>
 #include <Wire.h>
 #include <WiFi.h>
@@ -92,6 +92,12 @@ void setup() {
         // Non-fatal: web UI can drive the arm without the HW stick.
     }
 
+    // 4. HuskyLens (vision): non-fatal, arm runs fine even if this fails.    // <-- ADDED
+    // NOTE: uses Serial2 on GPIO16/17 - confirm these don't collide with    // <-- ADDED
+    // I2C_SDA/I2C_SCL or any BTN_*_PIN/JOY_SW_PIN in config.h.              // <-- ADDED
+    visionInit();                                                            // <-- ADDED
+
+
     loadPresetsFromFlash();
     loadFromFlash();
 
@@ -136,12 +142,25 @@ void loop() {
     WsMsg m;
     while (xQueueReceive(wsQueue, &m, 0)) processWsCmd(m.buf);
 
+    // Vision runs independent of bootState/arm motion - HuskyLens detection    // <-- ADDED
+    // and its HTTP POSTs should keep working even if the arm faulted.         // <-- ADDED
+    visionPoll();
+
+    // Push a status frame whenever the visible tag changes (including the
+    // -1 "cleared" transition) so the UI indicator updates without waiting
+    // for other activity.
+    static int lastTagShown = -2;
+    int curTag = visionCurrentTag();
+    if (curTag != lastTagShown) {
+        lastTagShown = curTag;
+        pendingBroadcast = true;
+    }
+
     // STATE_FAULT: skip every motion path. WS + serial stay alive so the user
     // sees the fault on the UI and can issue a STATUS / RAW probe over serial.
     if (bootState != STATE_FAULT) {
         processJoystick();
         processWebJog();
-        processIkWebJog();
         processButtons();
         processPlayback();
         processPresetMove();  // advances staged preset moves between phases
@@ -166,12 +185,11 @@ void loop() {
         lastCleanupMs = millis();
     }
 
-    if ((pendingBroadcast || joyActive || webJogActive || ikJogActive || ikWebJogActive)
+    if ((pendingBroadcast || joyActive || webJogActive)
         && millis() - lastBroadMs >= 50) {
         broadcastStatus();
         lastBroadMs      = millis();
         pendingBroadcast = false;
-        ikJogActive      = false;
     }
 
     if (millis() - lastFkMs >= 500) {

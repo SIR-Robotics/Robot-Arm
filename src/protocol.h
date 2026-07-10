@@ -16,4 +16,9 @@ void onWsEvent(AsyncWebSocket*, AsyncWebSocketClient* client,
 void registerHttpRoutes(AsyncWebServer& srv);   // GET/POST /poses.json
 int  importPosesFromJson(const char* buf, size_t len);
 
+// Run a color sequence ("red"/"yellow"/"blue") with logging + a WS toast to
+// the browser. One path for every trigger source: the /api/run/* HTTP routes
+// (AMR) and the HuskyLens tag handler (vision) both land here.
+void triggerColorRun(const char* color, const char* src);
+
 void processSerial();
