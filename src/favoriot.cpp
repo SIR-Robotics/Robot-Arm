@@ -7,9 +7,15 @@
 static WiFiClient network;
 static PubSubClient mqtt(network);
 static uint32_t lastConnectMs = 0;
+static const char* ONLINE_PRESENCE = "{\"to\":\"frontend\",\"type\":\"presence\",\"online\":true}";
+static const char* OFFLINE_PRESENCE = "{\"to\":\"frontend\",\"type\":\"presence\",\"online\":false}";
 
 static String streamTopic() {
     return String(DEVICE_ACCESS_TOKEN) + "/v2/streams";
+}
+
+static String rpcTopic() {
+    return String(DEVICE_ACCESS_TOKEN) + "/v2/rpc";
 }
 
 static void connectMqtt() {
@@ -17,7 +23,10 @@ static void connectMqtt() {
     if (lastConnectMs && millis() - lastConnectMs < 3000) return;
     lastConnectMs = millis();
     String clientId = "arm-" + String((uint32_t)ESP.getEfuseMac(), HEX);
-    if (mqtt.connect(clientId.c_str(), DEVICE_ACCESS_TOKEN, DEVICE_ACCESS_TOKEN)) {
+    String topic = rpcTopic();
+    if (mqtt.connect(clientId.c_str(), DEVICE_ACCESS_TOKEN, DEVICE_ACCESS_TOKEN,
+                     topic.c_str(), 0, true, OFFLINE_PRESENCE)) {
+        mqtt.publish(topic.c_str(), ONLINE_PRESENCE, true);
         Serial.println("[Favoriot] connected");
     } else {
         Serial.printf("[Favoriot] connection failed: %d\n", mqtt.state());
