@@ -1,6 +1,7 @@
 // ─── arm.cpp — Joint table, smooth motion engine, recording, playback ───────
 #include "arm.h"
 #include "globals.h"
+#include "favoriot.h"
 #include <math.h>
 
 // ── Link geometry (mm) — measured from the physical arm.
@@ -251,6 +252,10 @@ static float   presetSavedSpd = 0;
 
 static void presetStartPhase(uint8_t phase) {
     Serial.printf("[PRESET] Phase %u: %s\n", (unsigned)phase + 1, PHASE_NAMES[phase]);
+    char action[80];
+    snprintf(action, sizeof(action), "Preset phase %u: %s",
+             (unsigned)phase + 1, PHASE_NAMES[phase]);
+    favoriotAction(action);
     for (uint8_t k = 0; k < PHASE_SIZES[phase]; k++) {
         uint8_t j = PHASE_JOINTS[phase][k];
         setServo(j, presetTarget[j]);   // motion engine ramps at PRESET_SPEED_DEG_S
@@ -287,6 +292,7 @@ void processPresetMove() {
         presetActive  = false;
         motionSpeed   = presetSavedSpd;
         Serial.println("[PRESET] Complete");
+        favoriotAction("Preset complete");
         pendingBroadcast = true;
         return;
     }
@@ -571,11 +577,15 @@ void processPlayback() {
         else {
             isPlaying = false; playIdx = 0;
             Serial.println("[PLAY] Done");
+            favoriotAction("Sequence complete");
             pendingBroadcast = true;
             return;
         }
     }
 
+    char action[64];
+    snprintf(action, sizeof(action), "Moving to pose %d of %d", playIdx + 1, playSrcLen);
+    favoriotAction(action);
     for (int i = 0; i < 6; i++) setServo(i, playSrc[playIdx].a[i]);   // smooth ramp
     playWaitingForTarget = true;
     Serial.printf("[%s] %d/%d \"%s\"\n",

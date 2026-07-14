@@ -5,6 +5,7 @@
 #include "input.h"
 #include "vision.h"
 #include "globals.h"
+#include "favoriot.h"
 #include <WiFi.h>
 
 // ── No-heap JSON buffers
@@ -265,6 +266,9 @@ static size_t  importLen = 0;
 // fired the sequence.
 void triggerColorRun(const char* color, const char* src) {
     Serial.printf("[%s] %s sequence triggered\n", src, color);
+    char action[96];
+    snprintf(action, sizeof(action), "%s sequence triggered by %s", color, src);
+    favoriotAction(action);
     if (ws.count() > 0) {
         char note[120];
         snprintf(note, sizeof(note),

@@ -21,6 +21,7 @@
 #include "input.h"
 #include "protocol.h"
 #include "web_ui.h"
+#include "favoriot.h"
 
 // ─── WiFi (STA) ─────────────────────────────────────────────────────────────
 const char* WIFI_SSID = "ASEM Training";
@@ -136,11 +137,13 @@ void setup() {
     });
     registerHttpRoutes(server);                  // /poses.json GET + POST
     server.begin();
+    favoriotSetup();
     Serial.println("Send HELP for serial commands.");
 }
 
 // ─── Loop ───────────────────────────────────────────────────────────────────
 void loop() {
+    favoriotLoop();
     static uint32_t lastWifiRetryMs = 0;
     static bool wifiWasConnected = WiFi.status() == WL_CONNECTED;
     bool wifiConnected = WiFi.status() == WL_CONNECTED;
