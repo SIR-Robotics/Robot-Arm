@@ -113,6 +113,7 @@ void setup() {
     }
 
     WiFi.mode(WIFI_STA);
+    WiFi.setAutoReconnect(true);
     WiFi.begin(WIFI_SSID, WIFI_PASS);
     Serial.printf("[WiFi] Joining \"%s\"", WIFI_SSID);
     uint32_t t0 = millis();
@@ -124,7 +125,8 @@ void setup() {
         WiFi.setSleep(false);     // keep radio hot — phones already power-save aggressively
         Serial.printf("[WiFi] http://%s\n", WiFi.localIP().toString().c_str());
     } else {
-        Serial.println("[WiFi] FAILED");
+        Serial.printf("[WiFi] FAILED (status=%d); retrying in background\n",
+                      (int)WiFi.status());
     }
 
     ws.onEvent(onWsEvent);
@@ -139,6 +141,18 @@ void setup() {
 
 // ─── Loop ───────────────────────────────────────────────────────────────────
 void loop() {
+    static uint32_t lastWifiRetryMs = 0;
+    static bool wifiWasConnected = WiFi.status() == WL_CONNECTED;
+    bool wifiConnected = WiFi.status() == WL_CONNECTED;
+    if (wifiConnected && !wifiWasConnected) {
+        Serial.printf("[WiFi] http://%s\n", WiFi.localIP().toString().c_str());
+    } else if (!wifiConnected && millis() - lastWifiRetryMs >= 10000) {
+        lastWifiRetryMs = millis();
+        Serial.println("[WiFi] Retrying...");
+        WiFi.reconnect();
+    }
+    wifiWasConnected = wifiConnected;
+
     WsMsg m;
     while (xQueueReceive(wsQueue, &m, 0)) processWsCmd(m.buf);
 
