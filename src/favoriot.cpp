@@ -23,8 +23,13 @@ static String rpcTopic() {
 static void handleMessage(char*, byte* payload, unsigned int length) {
     StaticJsonDocument<128> message;
     if (deserializeJson(message, payload, length)) return;
-    if (strcmp(message["to"] | "", "arm") != 0 ||
-        strcmp(message["command"] | "", "check_tagging") != 0) return;
+    if (strcmp(message["to"] | "", "arm") != 0) return;
+
+    if (strcmp(message["command"] | "", "presence") == 0) {
+        mqtt.publish(rpcTopic().c_str(), ONLINE_PRESENCE, false);
+        return;
+    }
+    if (strcmp(message["command"] | "", "check_tagging") != 0) return;
 
     uint32_t id = message["id"] | 0;
     if (id > 0) visionRequestTagging(id);
