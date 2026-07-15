@@ -293,6 +293,7 @@ void processPresetMove() {
         motionSpeed   = presetSavedSpd;
         Serial.println("[PRESET] Complete");
         favoriotAction("Preset complete");
+        favoriotSortCompleted();
         pendingBroadcast = true;
         return;
     }
@@ -412,6 +413,7 @@ void startPlayback() {
 
 void stopPlayback() {
     isPlaying = false; isCycling = false; playWaitingForTarget = false; playPauseUntil = 0; pendingBroadcast = true;
+    favoriotSortCancelled();
 }
 
 void startCycle() {
@@ -578,6 +580,7 @@ void processPlayback() {
             isPlaying = false; playIdx = 0;
             Serial.println("[PLAY] Done");
             favoriotAction("Sequence complete");
+            favoriotSortCompleted();
             pendingBroadcast = true;
             return;
         }

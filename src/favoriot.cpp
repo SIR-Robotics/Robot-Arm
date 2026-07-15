@@ -11,6 +11,9 @@ static PubSubClient mqtt(network);
 static uint32_t lastConnectMs = 0;
 static const char* ONLINE_PRESENCE = "{\"to\":\"frontend\",\"type\":\"presence\",\"online\":true}";
 static const char* OFFLINE_PRESENCE = "{\"to\":\"frontend\",\"type\":\"presence\",\"online\":false}";
+static int pendingSortTag = -1;
+static char pendingSortColor[8] = "";
+static bool pendingSortComplete = false;
 
 static String streamTopic() {
     return String(DEVICE_ACCESS_TOKEN) + "/v2/streams";
@@ -60,6 +63,16 @@ static void publish(const char* key, const char* value) {
     mqtt.publish(streamTopic().c_str(), payload);
 }
 
+static void publishCompletedSort() {
+    if (!pendingSortComplete || !mqtt.connected()) return;
+    char payload[192];
+    snprintf(payload, sizeof(payload),
+             "{\"device_developer_id\":\"%s\",\"data\":{"
+             "\"event\":\"book_sorted\",\"tag\":%d,\"color\":\"%s\"}}",
+             DEVICE_DEVELOPER_ID, pendingSortTag, pendingSortColor);
+    if (mqtt.publish(streamTopic().c_str(), payload)) favoriotSortCancelled();
+}
+
 void favoriotSetup() {
     mqtt.setServer("mqtt.favoriot.com", 1883);
     mqtt.setCallback(handleMessage);
@@ -68,6 +81,7 @@ void favoriotSetup() {
 void favoriotLoop() {
     connectMqtt();
     mqtt.loop();
+    publishCompletedSort();
 }
 
 void favoriotAction(const char* action) {
@@ -77,6 +91,11 @@ void favoriotAction(const char* action) {
 }
 
 void favoriotTaggingResult(uint32_t id, const char* status, int tag, const char* color) {
+    if (strcmp(status, "started") == 0 && tag >= 1 && tag <= 3 && color) {
+        pendingSortTag = tag;
+        snprintf(pendingSortColor, sizeof(pendingSortColor), "%s", color);
+        pendingSortComplete = false;
+    }
     if (!mqtt.connected()) return;
     char payload[160];
     if (tag >= 0 && color) {
@@ -91,4 +110,16 @@ void favoriotTaggingResult(uint32_t id, const char* status, int tag, const char*
                  (unsigned long)id, status);
     }
     mqtt.publish(rpcTopic().c_str(), payload);
+}
+
+void favoriotSortCompleted() {
+    if (pendingSortTag < 0) return;
+    pendingSortComplete = true;
+    publishCompletedSort();
+}
+
+void favoriotSortCancelled() {
+    pendingSortTag = -1;
+    pendingSortColor[0] = '\0';
+    pendingSortComplete = false;
 }
