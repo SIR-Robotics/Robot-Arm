@@ -6,6 +6,7 @@
 #include "vision.h"
 #include "protocol.h"   // triggerColorRun — same path the /api/run/* routes use
 #include "arm.h"        // isPlaying/isCycling/presetActive — don't preempt a move
+#include "favoriot.h"
 #include <HUSKYLENS.h>
 
 // ---------------- USER CONFIG ----------------
@@ -18,11 +19,13 @@ static const long VISION_UART_BAUD = 9600;
 // /api/run/red|yellow|blue endpoints — no HTTP loopback: those routes live
 // on this same ESP32, and a blocking self-POST would stall the motion loop.
 static const char* TAG_COLOR[] = { nullptr, "red", "yellow", "blue" };  // tags 1..3
+static const uint8_t TAG_PRESET[] = { 0, PRESET_RED, PRESET_YELLOW, PRESET_BLUE };
 static const int   TAG_COLOR_N = sizeof(TAG_COLOR) / sizeof(TAG_COLOR[0]);
 
-static const unsigned long VISION_POLL_INTERVAL_MS    = 300;
-static const unsigned long VISION_TAG_HOLD_MS         = 2000; // UI shows a tag this long after last sighting
-static const unsigned long VISION_TRIGGER_COOLDOWN_MS = 5000; // min gap between two triggers of the SAME tag
+static const unsigned long VISION_POLL_INTERVAL_MS = 300;
+static const unsigned long VISION_TAG_HOLD_MS      = 2000;
+static const unsigned long TAGGING_SCAN_MS         = 5000;
+static const unsigned long TAGGING_QUEUE_MS        = 60000;
 // ----------------------------------------------
 
 static HUSKYLENS huskylens;
@@ -30,27 +33,36 @@ static bool visionReady = false;
 static unsigned long lastPollTime = 0;
 static int           lastSeenTagID = -1;   // most recent detection (for the UI)
 static unsigned long lastSeenMs    = 0;
-static int           lastTrigTagID = -1;   // dedup so a tag held in view fires once
-static unsigned long lastTrigMs    = 0;
+static uint32_t      taggingRequestId = 0;
+static unsigned long taggingRequestedMs = 0;
+static unsigned long taggingScanMs = 0;
+static bool          taggingScanning = false;
 
 int visionCurrentTag() {
   if (lastSeenTagID < 0 || millis() - lastSeenMs > VISION_TAG_HOLD_MS) return -1;
   return lastSeenTagID;
 }
 
-// Fire the color sequence mapped to this tag, if any. Guards:
-//  - unmapped tag IDs are ignored (logged once per sighting via visionPoll)
-//  - never preempt a sequence already in flight (playback/cycle/preset)
-//  - a tag continuously in view fires once; re-firing the SAME tag needs
-//    VISION_TRIGGER_COOLDOWN_MS to pass. A DIFFERENT tag fires immediately.
-static void maybeTrigger(int tagID) {
-  if (tagID < 1 || tagID >= TAG_COLOR_N || !TAG_COLOR[tagID]) return;
-  if (isPlaying || isCycling || presetActive) return;
-  if (tagID == lastTrigTagID && millis() - lastTrigMs < VISION_TRIGGER_COOLDOWN_MS) return;
+static void finishTagging(const char* status, int tag = -1, const char* color = nullptr) {
+  favoriotTaggingResult(taggingRequestId, status, tag, color);
+  taggingRequestId = 0;
+  taggingScanning = false;
+}
 
-  lastTrigTagID = tagID;
-  lastTrigMs    = millis();
-  triggerColorRun(TAG_COLOR[tagID], "vision");
+void visionRequestTagging(uint32_t id) {
+  if (!visionReady) {
+    favoriotTaggingResult(id, "vision_unavailable");
+    return;
+  }
+  if (taggingRequestId != 0) {
+    favoriotTaggingResult(id, "busy");
+    return;
+  }
+
+  taggingRequestId = id;
+  taggingRequestedMs = millis();
+  taggingScanning = false;
+  Serial.printf("[Vision] Tagging request %lu queued\n", (unsigned long)id);
 }
 
 bool visionInit() {
@@ -77,6 +89,22 @@ void visionPoll() {
   if (millis() - lastPollTime < VISION_POLL_INTERVAL_MS) return;
   lastPollTime = millis();
 
+  bool armBusy = isPlaying || isCycling || presetActive;
+  if (taggingRequestId != 0) {
+    if (millis() - taggingRequestedMs >= TAGGING_QUEUE_MS) {
+      finishTagging("queue_timeout");
+    } else if (armBusy) {
+      taggingScanning = false;
+    } else if (!taggingScanning) {
+      taggingScanning = true;
+      taggingScanMs = millis();
+      Serial.printf("[Vision] Tagging request %lu scanning\n",
+                    (unsigned long)taggingRequestId);
+    } else if (millis() - taggingScanMs >= TAGGING_SCAN_MS) {
+      finishTagging("not_found");
+    }
+  }
+
   if (!huskylens.request()) {
     Serial.println("[Vision] Failed to request data from HuskyLens - check connection.");
     return;
@@ -95,7 +123,15 @@ void visionPoll() {
       lastSeenMs    = millis();
       if (isNew) Serial.printf("[Vision] Detected tag ID: %d\n", tagID);
 
-      maybeTrigger(tagID);
+      if (taggingScanning && tagID >= 1 && tagID < TAG_COLOR_N && TAG_COLOR[tagID]) {
+        const char* color = TAG_COLOR[tagID];
+        if (presets[TAG_PRESET[tagID]].len <= 0) {
+          finishTagging("preset_missing");
+        } else {
+          triggerColorRun(color, "mobile");
+          finishTagging("started", tagID, color);
+        }
+      }
     }
   }
 }

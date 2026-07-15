@@ -1,6 +1,6 @@
 #pragma once
 // ─── vision.h ───────────────────────────────────────────────────────────────
-// HuskyLens tag detection -> HTTP API. Self-contained: doesn't touch
+// Mobile-requested HuskyLens tag detection. Self-contained: doesn't touch
 // servoMutex/wsQueue or any arm state, so it can be added/removed without
 // affecting arm.cpp / input.cpp / protocol.cpp.
 //
@@ -19,8 +19,12 @@
 // short timeout, vision stays disabled and returns false, but the rest of
 // the arm keeps running normally.
 bool visionInit();
+
+// Queue one mobile-requested scan. A second request is rejected as busy.
+void visionRequestTagging(uint32_t id);
  
-// Call every loop() tick. Internally rate-limited, so it's cheap to call
+// Call every loop() tick. Detection updates the UI; only a queued mobile
+// request may trigger a preset. Internally rate-limited, so it's cheap to call
 // unconditionally even when bootState == STATE_FAULT.
 void visionPoll();
 
@@ -28,4 +32,3 @@ void visionPoll();
 // for VISION_TAG_HOLD_MS — so the UI indicator self-clears instead of
 // showing a stale detection forever.
 int visionCurrentTag();
- 

@@ -259,7 +259,7 @@ int importPosesFromJson(const char* buf, size_t len) {
 static char    importBuf[3200];
 static size_t  importLen = 0;
 
-// Shared color-sequence trigger. vision.cpp calls this directly instead of
+// Shared color-sequence trigger. A requested vision scan calls this directly instead of
 // HTTP-POSTing to our own /api/run/* routes — same code path, but no blocking
 // loopback request inside loop() and no WiFi dependency for an on-device
 // action. The WS "n" frame drives a browser toast so the operator sees who
