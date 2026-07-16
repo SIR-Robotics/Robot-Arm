@@ -1,5 +1,4 @@
 #include "favoriot.h"
-#include "vision.h"
 
 #include <Arduino.h>
 #include <ArduinoJson.h>
@@ -32,10 +31,6 @@ static void handleMessage(char*, byte* payload, unsigned int length) {
         mqtt.publish(rpcTopic().c_str(), ONLINE_PRESENCE, false);
         return;
     }
-    if (strcmp(message["command"] | "", "check_tagging") != 0) return;
-
-    uint32_t id = message["id"] | 0;
-    if (id > 0) visionRequestTagging(id);
 }
 
 static void connectMqtt() {
@@ -90,26 +85,10 @@ void favoriotAction(const char* action) {
     publish("action", message);
 }
 
-void favoriotTaggingResult(uint32_t id, const char* status, int tag, const char* color) {
-    if (strcmp(status, "started") == 0 && tag >= 1 && tag <= 3 && color) {
-        pendingSortTag = tag;
-        snprintf(pendingSortColor, sizeof(pendingSortColor), "%s", color);
-        pendingSortComplete = false;
-    }
-    if (!mqtt.connected()) return;
-    char payload[160];
-    if (tag >= 0 && color) {
-        snprintf(payload, sizeof(payload),
-                 "{\"to\":\"mecanum\",\"type\":\"tagging_result\","
-                 "\"id\":%lu,\"status\":\"%s\",\"tag\":%d,\"color\":\"%s\"}",
-                 (unsigned long)id, status, tag, color);
-    } else {
-        snprintf(payload, sizeof(payload),
-                 "{\"to\":\"mecanum\",\"type\":\"tagging_result\","
-                 "\"id\":%lu,\"status\":\"%s\"}",
-                 (unsigned long)id, status);
-    }
-    mqtt.publish(rpcTopic().c_str(), payload);
+void favoriotSortStarted(int tag, const char* color) {
+    pendingSortTag = tag;
+    snprintf(pendingSortColor, sizeof(pendingSortColor), "%s", color);
+    pendingSortComplete = false;
 }
 
 void favoriotSortCompleted() {

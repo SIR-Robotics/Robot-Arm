@@ -24,8 +24,7 @@ static const int   TAG_COLOR_N = sizeof(TAG_COLOR) / sizeof(TAG_COLOR[0]);
 
 static const unsigned long VISION_POLL_INTERVAL_MS = 300;
 static const unsigned long VISION_TAG_HOLD_MS      = 2000;
-static const unsigned long TAGGING_SCAN_MS         = 5000;
-static const unsigned long TAGGING_QUEUE_MS        = 60000;
+static const unsigned long TAG_RUN_DELAY_MS        = 10000;
 // ----------------------------------------------
 
 static HUSKYLENS huskylens;
@@ -33,36 +32,14 @@ static bool visionReady = false;
 static unsigned long lastPollTime = 0;
 static int           lastSeenTagID = -1;   // most recent detection (for the UI)
 static unsigned long lastSeenMs    = 0;
-static uint32_t      taggingRequestId = 0;
-static unsigned long taggingRequestedMs = 0;
-static unsigned long taggingScanMs = 0;
-static bool          taggingScanning = false;
+static int           pendingTagID = -1;
+static const char*   pendingColor = nullptr;
+static unsigned long pendingRunMs = 0;
+static bool          tagTriggerArmed = true;
 
 int visionCurrentTag() {
   if (lastSeenTagID < 0 || millis() - lastSeenMs > VISION_TAG_HOLD_MS) return -1;
   return lastSeenTagID;
-}
-
-static void finishTagging(const char* status, int tag = -1, const char* color = nullptr) {
-  favoriotTaggingResult(taggingRequestId, status, tag, color);
-  taggingRequestId = 0;
-  taggingScanning = false;
-}
-
-void visionRequestTagging(uint32_t id) {
-  if (!visionReady) {
-    favoriotTaggingResult(id, "vision_unavailable");
-    return;
-  }
-  if (taggingRequestId != 0) {
-    favoriotTaggingResult(id, "busy");
-    return;
-  }
-
-  taggingRequestId = id;
-  taggingRequestedMs = millis();
-  taggingScanning = false;
-  Serial.printf("[Vision] Tagging request %lu queued\n", (unsigned long)id);
 }
 
 bool visionInit() {
@@ -90,19 +67,16 @@ void visionPoll() {
   lastPollTime = millis();
 
   bool armBusy = isPlaying || isCycling || presetActive;
-  if (taggingRequestId != 0) {
-    if (millis() - taggingRequestedMs >= TAGGING_QUEUE_MS) {
-      finishTagging("queue_timeout");
-    } else if (armBusy) {
-      taggingScanning = false;
-    } else if (!taggingScanning) {
-      taggingScanning = true;
-      taggingScanMs = millis();
-      Serial.printf("[Vision] Tagging request %lu scanning\n",
-                    (unsigned long)taggingRequestId);
-    } else if (millis() - taggingScanMs >= TAGGING_SCAN_MS) {
-      finishTagging("not_found");
-    }
+  if (pendingTagID >= 1 && !armBusy && millis() - pendingRunMs >= TAG_RUN_DELAY_MS) {
+    int tagID = pendingTagID;
+    const char* color = pendingColor;
+    pendingTagID = -1;
+    pendingColor = nullptr;
+    favoriotSortStarted(tagID, color);
+    triggerColorRun(color, "vision");
+  }
+  if (!tagTriggerArmed && pendingTagID < 0 && millis() - lastSeenMs > VISION_TAG_HOLD_MS) {
+    tagTriggerArmed = true;
   }
 
   if (!huskylens.request()) {
@@ -123,14 +97,19 @@ void visionPoll() {
       lastSeenMs    = millis();
       if (isNew) Serial.printf("[Vision] Detected tag ID: %d\n", tagID);
 
-      if (taggingScanning && tagID >= 1 && tagID < TAG_COLOR_N && TAG_COLOR[tagID]) {
+      if (tagTriggerArmed && pendingTagID < 0 && !armBusy &&
+          tagID >= 1 && tagID < TAG_COLOR_N && TAG_COLOR[tagID]) {
         const char* color = TAG_COLOR[tagID];
         if (presets[TAG_PRESET[tagID]].len <= 0) {
-          finishTagging("preset_missing");
+          Serial.printf("[Vision] %s preset missing\n", color);
         } else {
-          triggerColorRun(color, "mobile");
-          finishTagging("started", tagID, color);
+          pendingTagID = tagID;
+          pendingColor = color;
+          pendingRunMs = millis();
+          Serial.printf("[Vision] Tag %d detected; running %s in 10 seconds\n",
+                        tagID, color);
         }
+        tagTriggerArmed = false;
       }
     }
   }
